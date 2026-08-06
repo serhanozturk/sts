@@ -585,7 +585,7 @@ def required_bars(conditions):
             p2 = int(num(c.get("p2"), 0) or 0)
             need = max(need, max(p1, p2) * 5)
         elif t == "rsi":
-            need = max(need, p1 * 5)
+            need = max(need, (p1 if p1 > 0 else 14) * 5)
         elif t == "volume":
             need = max(need, p1 + 3)
     return min(need, 1500)
@@ -618,9 +618,11 @@ def eval_conditions(rule, ctx):
             else:
                 note = f"ema hesaplanamadi (mum yetersiz)"
         elif t == "rsi":
-            r = rsi(ctx["closes"], int(p1 or 14))
+            # periyot sabit 14 (panelde tek deger alinir: esik)
+            per = int(p1) if p1 else 14
+            r = rsi(ctx["closes"], per)
             ok = compare(r, op, p2)
-            note = f"rsi{int(p1 or 14)}={r:.2f} {op} {p2} -> {ok}" if r is not None else "rsi hesaplanamadi"
+            note = f"rsi{per}={r:.2f} {op} {p2} -> {ok}" if r is not None else "rsi hesaplanamadi"
         elif t == "price":
             lp = ctx.get("last_close")
             ok = compare(lp, op, p2)
@@ -628,11 +630,13 @@ def eval_conditions(rule, ctx):
         elif t == "oi_change":
             chg = ctx.get("oi_change_pct")
             ok = compare(chg, op, p2)
-            note = f"oi_degisim={chg if chg is None else round(chg,2)}% {op} {p2}% -> {ok}"
+            note = (f"oi son {int(p1 or 3)} bar ort. gore="
+                    f"{chg if chg is None else round(chg,2)}% {op} {p2}% -> {ok}")
         elif t == "volume":
-            ratio = ctx.get("vol_ratio")
-            ok = compare(ratio, op, p2)
-            note = f"hacim_orani={ratio if ratio is None else round(ratio,2)}x {op} {p2}x -> {ok}"
+            chg = ctx.get("vol_change_pct")
+            ok = compare(chg, op, p2)
+            note = (f"hacim son {int(p1 or 3)} bar ort. gore="
+                    f"{chg if chg is None else round(chg,2)}% {op} {p2}% -> {ok}")
         elif t == "funding":
             f = ctx.get("funding_pct")
             ok = compare(f, op, p2)
@@ -1008,10 +1012,12 @@ class Bot:
             vols = [c[5] for c in closed]
             for c in conds:
                 if (c.get("type") or "").lower() == "volume":
-                    n = int(num(c.get("p1"), 20) or 20)
+                    n = int(num(c.get("p1"), 3) or 3)
                     if len(vols) > n:
-                        avg = sum(vols[-n-1:-1]) / n
-                        ctx["vol_ratio"] = (vols[-1] / avg) if avg > 0 else None
+                        prev = vols[-(n + 1):-1]          # son bar haric N bar
+                        avg = sum(prev) / len(prev)
+                        if avg > 0:
+                            ctx["vol_change_pct"] = (vols[-1] - avg) / avg * 100.0
                     break
 
         if "oi_change" in cond_types:
@@ -1022,8 +1028,11 @@ class Bot:
                     if hist and len(hist) >= n + 1:
                         vals = [h.get("openInterestValue") or h.get("openInterestAmount") for h in hist]
                         vals = [float(v) for v in vals if v is not None]
-                        if len(vals) >= n + 1 and vals[-(n+1)] > 0:
-                            ctx["oi_change_pct"] = (vals[-1] - vals[-(n+1)]) / vals[-(n+1)] * 100.0
+                        if len(vals) >= n + 1:
+                            prev = vals[-(n + 1):-1]      # son bar haric N bar
+                            avg = sum(prev) / len(prev)
+                            if avg > 0:
+                                ctx["oi_change_pct"] = (vals[-1] - avg) / avg * 100.0
                     break
 
         if "funding" in cond_types:
