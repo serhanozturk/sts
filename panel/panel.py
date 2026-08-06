@@ -195,6 +195,8 @@ def validate_rule(d):
         err.append(f"periyot gecersiz (izinli: {', '.join(sorted(TIMEFRAMES))})")
 
     logic = (d.get("logic") or "AND").upper()
+    if logic == "-":
+        logic = "AND"   # tek kural: mantik operatoru anlamsiz, AND ile ayni
     if logic not in ("AND", "OR"):
         err.append("mantik AND veya OR olmali")
 
@@ -327,158 +329,280 @@ HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#F5F2EA">
 <title>STS Panel</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
+:root{
+  --bg:#F5F2EA; --surface:#FCFAF6; --surface2:#EDE8DC; --border:#DCD5C6;
+  --text:#1A1815; --text2:#6B655C; --text3:#9B948A;
+  --green:#2D6A4F; --greenBg:#E2EDE6; --greenBd:#BBD4C4;
+  --coral:#C9553B; --coralBg:#F7E4DE; --coralBd:#E8C0B4;
+  --purple:#6B4E9B; --purpleBg:#EBE4F5;
+  --amber:#8A6410; --amberBg:#F5EBD3;
+  --shadow:0 1px 2px rgba(26,24,21,.05);
+}
+[data-theme="dark"]{
+  --bg:#15140F; --surface:#1E1C16; --surface2:#272419; --border:#3B372C;
+  --text:#F2EDE2; --text2:#A69F91; --text3:#746D60;
+  --green:#74C494; --greenBg:#1A3226; --greenBd:#2A4C38;
+  --coral:#E8836A; --coralBg:#3A211A; --coralBd:#5A342A;
+  --purple:#B79BE8; --purpleBg:#2A2140;
+  --amber:#DCA83A; --amberBg:#33280F;
+  --shadow:none;
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f0f11;color:#e2e0d8;padding:14px;max-width:1100px;margin:0 auto}
-.hdr{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:#1a1a1f;border:1px solid #2e2e35;border-radius:12px;margin-bottom:10px;flex-wrap:wrap;gap:8px}
-.hdr h1{font-size:16px;font-weight:600}
-.badge{font-size:11px;padding:2px 8px;border-radius:4px;font-weight:600}
-.b-test{background:#2a2010;color:#ef9f27}
-.b-live{background:#2a1010;color:#e24b4a}
-.b-ok{background:#12210f;color:#7cb342}
-.b-off{background:#2a1010;color:#e24b4a}
-.b-short{background:#2a1010;color:#e24b4a}
-.b-long{background:#12210f;color:#7cb342}
-.b-sig{background:#141417;color:#888780;border:1px solid #2e2e35}
-.b-rule{background:#1e1530;color:#a98fe0}
-.btn{padding:7px 14px;font-size:12px;font-weight:600;border-radius:8px;border:1px solid;cursor:pointer;background:transparent}
-.btn-stop{border-color:#4a1b1b;background:#1e1010;color:#e24b4a}
-.btn-go{border-color:#1a3d1e;background:#101a12;color:#7cb342}
-.tabs{display:flex;gap:4px;background:#141417;padding:4px;border-radius:8px;margin-bottom:12px;flex-wrap:wrap}
-.tab{padding:7px 16px;font-size:13px;border-radius:6px;color:#888780;cursor:pointer;border:none;background:transparent}
-.tab.on{background:#1a1a1f;color:#e2e0d8;font-weight:600;border:1px solid #3a3a42}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:14px}
-.met{background:#141417;border-radius:8px;padding:10px 12px}
-.met .l{font-size:11px;color:#5f5e5a;margin-bottom:3px}
-.met .v{font-size:20px;font-weight:600}
-.met .s{font-size:11px;color:#5f5e5a;margin-top:2px}
-.up{color:#7cb342}.dn{color:#e24b4a}.mut{color:#888780}
-.card{background:#1a1a1f;border:1px solid #2e2e35;border-radius:12px;padding:12px 14px;margin-bottom:10px}
-.sect{font-size:11px;font-weight:600;color:#5f5e5a;letter-spacing:.06em;text-transform:uppercase;margin:0 0 8px}
+html{-webkit-text-size-adjust:100%}
+body{
+  font-family:'Archivo',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  background:var(--bg); color:var(--text);
+  padding:14px; max-width:1160px; margin:0 auto;
+  transition:background .2s,color .2s;
+}
+.mono{font-family:'JetBrains Mono',ui-monospace,'SF Mono',Consolas,monospace}
+
+/* ---------- header ---------- */
+.hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:14px 18px;background:var(--surface);border:1px solid var(--border);
+  border-radius:14px;margin-bottom:12px;flex-wrap:wrap;box-shadow:var(--shadow)}
+.brand{font-size:22px;font-weight:800;letter-spacing:-.02em}
+.hdr-l{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.hdr-r{display:flex;align-items:center;gap:8px}
+
+.badge{font-size:10px;font-weight:700;padding:3px 9px;border-radius:20px;
+  letter-spacing:.06em;text-transform:uppercase;border:1px solid transparent;white-space:nowrap}
+.b-test{background:var(--amberBg);color:var(--amber);border-color:var(--amber)}
+.b-live{background:var(--coralBg);color:var(--coral);border-color:var(--coral)}
+.b-ok{background:var(--greenBg);color:var(--green);border-color:var(--greenBd)}
+.b-off{background:var(--coralBg);color:var(--coral);border-color:var(--coralBd)}
+.b-short{background:var(--coralBg);color:var(--coral)}
+.b-long{background:var(--greenBg);color:var(--green)}
+.b-sig{background:var(--surface2);color:var(--text2)}
+.b-rule{background:var(--purpleBg);color:var(--purple)}
+
+.btn{font-family:inherit;font-size:12px;font-weight:600;padding:8px 14px;
+  border-radius:9px;border:1px solid var(--border);background:var(--surface);
+  color:var(--text);cursor:pointer;transition:.15s;white-space:nowrap}
+.btn:hover{background:var(--surface2)}
+.btn-stop{border-color:var(--coralBd);background:var(--coralBg);color:var(--coral)}
+.btn-go{border-color:var(--greenBd);background:var(--greenBg);color:var(--green)}
+.icon-btn{width:36px;height:36px;padding:0;display:grid;place-items:center;font-size:15px}
+
+/* ---------- tabs ---------- */
+.tabs{display:flex;gap:4px;background:var(--surface2);padding:5px;
+  border-radius:11px;margin-bottom:16px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+.tab{font-family:inherit;font-size:11px;font-weight:700;letter-spacing:.07em;
+  text-transform:uppercase;padding:9px 16px;border-radius:7px;color:var(--text2);
+  cursor:pointer;border:1px solid transparent;background:transparent;
+  transition:.15s;white-space:nowrap}
+.tab:hover{color:var(--text)}
+.tab.on{background:var(--surface);color:var(--text);border-color:var(--border);box-shadow:var(--shadow)}
+
+/* ---------- section labels ---------- */
+.sect{font-size:10px;font-weight:700;color:var(--text3);letter-spacing:.1em;
+  text-transform:uppercase;margin:0 0 9px 2px}
+
+/* ---------- metrics ---------- */
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));
+  gap:10px;margin-bottom:18px}
+.met{background:var(--surface);border:1px solid var(--border);border-radius:13px;
+  padding:14px 16px;box-shadow:var(--shadow)}
+.met .l{font-size:11px;font-weight:500;color:var(--text2);margin-bottom:5px;letter-spacing:.01em}
+.met .v{font-size:26px;font-weight:800;letter-spacing:-.03em;line-height:1.05}
+.met .s{font-size:11px;color:var(--text3);margin-top:4px}
+.up{color:var(--green)}.dn{color:var(--coral)}.mut{color:var(--text2)}
+
+/* ---------- cards ---------- */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:13px;
+  padding:14px 16px;margin-bottom:12px;box-shadow:var(--shadow)}
+
+/* ---------- positions ---------- */
+.pos{display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:13px 15px;background:var(--surface);border:1px solid var(--border);
+  border-radius:12px;margin-bottom:8px;flex-wrap:wrap;box-shadow:var(--shadow)}
+.pos-l{min-width:0;flex:1}
+.pos-nm{display:flex;align-items:center;gap:7px;margin-bottom:5px;flex-wrap:wrap}
+.pos-nm b{font-size:16px;font-weight:800;letter-spacing:-.02em}
+.pos-dt{font-size:11px;color:var(--text2)}
+.pos-dt span{color:var(--text3)}
+.pos-r{text-align:right}
+.pnl{font-size:19px;font-weight:800;letter-spacing:-.02em;line-height:1.1}
+.pnl-pct{font-size:12px;font-weight:600;margin-top:1px}
+
+/* ---------- tables ---------- */
+.tw{overflow-x:auto;-webkit-overflow-scrolling:touch}
 table{width:100%;border-collapse:collapse;font-size:12px}
-th{text-align:left;color:#5f5e5a;font-weight:600;padding:6px 8px;border-bottom:1px solid #2e2e35;font-size:11px}
-td{padding:7px 8px;border-bottom:1px solid #222228;color:#c2c0b6}
-tr:last-child td{border-bottom:none}
-.pos{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#141417;border-radius:8px;margin-bottom:6px;flex-wrap:wrap;gap:6px}
-.pos .nm{font-size:14px;font-weight:600}
-.pos .dt{font-size:11px;color:#888780}
-.pnl{font-size:14px;font-weight:600}
-.empty{color:#5f5e5a;font-size:12px;padding:14px;text-align:center}
-.age{font-size:11px;color:#5f5e5a}
-#toast{position:fixed;bottom:16px;right:16px;background:#1a1a1f;border:1px solid #3a3a42;border-radius:8px;padding:10px 16px;font-size:12px;display:none}
-label{font-size:11px;color:#5f5e5a;display:block;margin-bottom:3px}
-input,select{width:100%;background:#141417;border:1px solid #2e2e35;border-radius:6px;color:#e2e0d8;padding:6px 8px;font-size:12px;font-family:inherit}
-input:focus,select:focus{outline:none;border-color:#5f5e5a}
-.frow{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:8px}
-.crow{display:grid;grid-template-columns:130px 70px 55px 90px 30px;gap:6px;align-items:center;margin-bottom:6px}
-.xbtn{background:#1e1010;border:1px solid #4a1b1b;color:#e24b4a;border-radius:6px;cursor:pointer;padding:6px 0;font-size:12px}
-.mini{background:transparent;border:1px solid #2e2e35;color:#888780;border-radius:5px;cursor:pointer;padding:3px 8px;font-size:11px;margin-left:4px}
-.mini:hover{border-color:#5f5e5a;color:#c2c0b6}
-.mini.del:hover{border-color:#4a1b1b;color:#e24b4a}
-@media(max-width:600px){td:nth-child(n+6),th:nth-child(n+6){display:none}.crow{grid-template-columns:1fr 1fr;grid-auto-rows:auto}}
+th{text-align:left;font-size:10px;font-weight:700;color:var(--text3);
+  letter-spacing:.07em;text-transform:uppercase;padding:8px 10px;
+  border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:10px;border-bottom:1px solid var(--border);color:var(--text);white-space:nowrap}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--surface2)}
+.empty{color:var(--text3);font-size:12px;padding:26px;text-align:center}
+
+/* ---------- form ---------- */
+label{font-size:11px;font-weight:500;color:var(--text2);display:block;margin-bottom:5px}
+input,select{width:100%;font-family:inherit;font-size:13px;background:var(--bg);
+  border:1px solid var(--border);border-radius:8px;color:var(--text);
+  padding:9px 10px;transition:.15s}
+input:focus,select:focus{outline:none;border-color:var(--text2)}
+input:disabled{background:var(--surface2);color:var(--text3);cursor:not-allowed}
+input::placeholder{color:var(--text3)}
+select{cursor:pointer;-webkit-appearance:none;appearance:none;
+  background-image:linear-gradient(45deg,transparent 50%,var(--text2) 50%),
+  linear-gradient(135deg,var(--text2) 50%,transparent 50%);
+  background-position:calc(100% - 15px) 50%,calc(100% - 10px) 50%;
+  background-size:5px 5px,5px 5px;background-repeat:no-repeat;padding-right:28px}
+.frow{display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));
+  gap:11px;margin-bottom:11px}
+.crow{display:grid;grid-template-columns:150px 82px 62px 1fr 34px;gap:7px;
+  align-items:center;margin-bottom:7px}
+.cunit{position:relative;display:flex;align-items:center}
+.cunit input{padding-right:30px}
+.cunit .u{position:absolute;right:10px;font-size:11px;font-weight:600;
+  color:var(--text3);pointer-events:none}
+.xbtn{font-family:inherit;background:var(--coralBg);border:1px solid var(--coralBd);
+  color:var(--coral);border-radius:8px;cursor:pointer;height:36px;font-size:14px;
+  font-weight:700;display:grid;place-items:center}
+.mini{font-family:inherit;background:transparent;border:1px solid var(--border);
+  color:var(--text2);border-radius:7px;cursor:pointer;padding:5px 10px;
+  font-size:11px;font-weight:600;margin-left:5px;transition:.15s}
+.mini:hover{border-color:var(--text2);color:var(--text)}
+.mini.del:hover{border-color:var(--coralBd);color:var(--coral);background:var(--coralBg)}
+.divider{border-top:1px solid var(--border);padding-top:12px;margin-top:12px}
+.errbox{display:none;background:var(--coralBg);border:1px solid var(--coralBd);
+  border-radius:9px;padding:11px 13px;margin-top:12px;font-size:12px;color:var(--coral)}
+#toast{position:fixed;bottom:18px;right:18px;background:var(--text);color:var(--bg);
+  border-radius:10px;padding:12px 18px;font-size:12px;font-weight:600;
+  display:none;z-index:99;box-shadow:0 4px 12px rgba(0,0,0,.15)}
+
+@media(max-width:720px){
+  body{padding:10px}
+  .brand{font-size:19px}
+  .met .v{font-size:22px}
+  .crow{grid-template-columns:1fr 1fr;gap:6px}
+  .crow>*:first-child{grid-column:1/-1}
+  .crow .xbtn{grid-column:1/-1}
+  th,td{padding:8px 7px;font-size:11px}
+  .pnl{font-size:16px}
+}
 </style>
 </head>
 <body>
 
 <div class="hdr">
-  <div style="display:flex;align-items:center;gap:10px">
-    <h1>STS</h1>
-    <span id="mode" class="badge b-test">-</span>
-    <span id="health" class="badge b-off">baglaniyor</span>
+  <div class="hdr-l">
+    <span class="brand">STS</span>
+    <span id="mode" class="badge b-test">—</span>
+    <span id="health" class="badge b-off">Baglaniyor</span>
   </div>
-  <div style="display:flex;align-items:center;gap:10px">
-    <span id="ks-state" class="age"></span>
-    <button id="ks-btn" class="btn btn-stop" onclick="toggleKs()">durdur</button>
+  <div class="hdr-r">
+    <span id="ks-state" class="badge b-off" style="display:none">Kill-switch</span>
+    <button class="btn icon-btn" onclick="toggleTheme()" id="theme-btn" title="Tema">&#9789;</button>
+    <button id="ks-btn" class="btn btn-stop" onclick="toggleKs()">Durdur</button>
   </div>
 </div>
 
 <div class="tabs">
-  <button class="tab on" onclick="show('durum',this)">durum</button>
-  <button class="tab" onclick="show('islemler',this)">islemler</button>
-  <button class="tab" onclick="show('olaylar',this)">olaylar</button>
-  <button class="tab" onclick="show('kurallar',this)">kurallar</button>
+  <button class="tab on" onclick="show('durum',this)">Durum</button>
+  <button class="tab" onclick="show('islemler',this)">Islemler</button>
+  <button class="tab" onclick="show('olaylar',this)">Olaylar</button>
+  <button class="tab" onclick="show('kurallar',this)">Kurallar</button>
 </div>
 
 <div id="p-durum">
   <div class="grid">
-    <div class="met"><div class="l">bakiye</div><div class="v" id="m-bal">-</div><div class="s">USDT</div></div>
-    <div class="met"><div class="l">acik PnL</div><div class="v" id="m-upnl">-</div><div class="s">anlik</div></div>
-    <div class="met"><div class="l">sinyal havuzu</div><div class="v" id="m-sig">-</div><div class="s">acik / max</div></div>
-    <div class="met"><div class="l">ozel havuz</div><div class="v" id="m-rule">-</div><div class="s">acik / max</div></div>
+    <div class="met"><div class="l">Bakiye</div><div class="v" id="m-bal">—</div><div class="s">USDT</div></div>
+    <div class="met"><div class="l">Acik PnL</div><div class="v" id="m-upnl">—</div><div class="s" id="m-upnl-pct">Anlik</div></div>
+    <div class="met"><div class="l">Sinyal havuzu</div><div class="v" id="m-sig">—</div><div class="s">Acik / max</div></div>
+    <div class="met"><div class="l">Ozel havuz</div><div class="v" id="m-rule">—</div><div class="s">Acik / max</div></div>
   </div>
-  <p class="sect">acik pozisyonlar</p>
-  <div id="positions"><div class="empty">yukleniyor...</div></div>
+  <p class="sect">Acik pozisyonlar</p>
+  <div id="positions"><div class="empty">Yukleniyor...</div></div>
 </div>
 
 <div id="p-islemler" style="display:none">
   <div class="grid">
-    <div class="met"><div class="l">kapanan islem</div><div class="v" id="t-count">-</div></div>
-    <div class="met"><div class="l">toplam PnL</div><div class="v" id="t-pnl">-</div><div class="s">USDT</div></div>
-    <div class="met"><div class="l">isabet</div><div class="v" id="t-win">-</div></div>
+    <div class="met"><div class="l">Kapanan islem</div><div class="v" id="t-count">—</div><div class="s">Toplam</div></div>
+    <div class="met"><div class="l">Toplam PnL</div><div class="v" id="t-pnl">—</div><div class="s" id="t-pnl-pct">Teminata gore</div></div>
+    <div class="met"><div class="l">Isabet orani</div><div class="v" id="t-win">—</div><div class="s" id="t-win-sub">Karli / toplam</div></div>
   </div>
-  <div class="card"><div style="overflow-x:auto"><table id="trades">
-    <thead><tr><th>coin</th><th>yon</th><th>kaynak</th><th>giris</th><th>cikis</th><th>PnL</th><th>sebep</th><th>acilis</th></tr></thead>
+  <p class="sect">Islem gecmisi</p>
+  <div class="card"><div class="tw"><table id="trades">
+    <thead><tr><th>Coin</th><th>Yon</th><th>Kaynak</th><th>Giris</th><th>Cikis</th><th>PnL</th><th>Sebep</th><th>Acilis</th></tr></thead>
     <tbody></tbody>
   </table></div></div>
 </div>
 
 <div id="p-olaylar" style="display:none">
-  <div class="card"><div style="overflow-x:auto"><table id="events">
-    <thead><tr><th>zaman</th><th>tip</th><th>coin</th><th>detay</th></tr></thead>
+  <p class="sect">Olay akisi</p>
+  <div class="card"><div class="tw"><table id="events">
+    <thead><tr><th>Zaman</th><th>Tip</th><th>Coin</th><th>Detay</th></tr></thead>
     <tbody></tbody>
   </table></div></div>
 </div>
 
 <div id="p-kurallar" style="display:none">
   <div class="card">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-      <p class="sect" style="margin:0" id="form-title">yeni kural</p>
-      <button class="btn btn-go" onclick="toggleForm()" id="form-toggle">+ kural ekle</button>
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;flex-wrap:wrap">
+      <p class="sect" style="margin:0" id="form-title">Yeni kural</p>
+      <button class="btn btn-go" onclick="toggleForm()" id="form-toggle">+ Kural ekle</button>
     </div>
 
     <div id="rule-form" style="display:none">
       <div class="frow">
-        <div><label>coin</label><input id="f-coin" placeholder="HEI"></div>
-        <div><label>yon</label><select id="f-dir"><option value="SHORT">short</option><option value="LONG">long</option></select></div>
-        <div><label>periyot</label><select id="f-tf">
+        <div><label>Coin</label><input id="f-coin" placeholder="HEI"></div>
+        <div><label>Yon</label><select id="f-dir"><option value="SHORT">Short</option><option value="LONG">Long</option></select></div>
+        <div><label>Periyot</label><select id="f-tf">
           <option value="5m">5m</option><option value="15m">15m</option><option value="30m">30m</option>
           <option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
         </select></div>
-        <div><label>mantik</label><select id="f-logic"><option value="AND">ve</option><option value="OR">veya</option></select></div>
       </div>
 
-      <div style="border-top:1px solid #2e2e35;padding-top:10px;margin-top:10px">
-        <label style="display:block;margin-bottom:6px">kosullar</label>
+      <div class="divider">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:9px;flex-wrap:wrap">
+          <label style="margin:0">Kosullar</label>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span style="font-size:11px;color:var(--text2)">Mantik</span>
+            <select id="f-logic" style="width:110px;padding:6px 8px;font-size:12px">
+              <option value="-">— (tek kural)</option>
+              <option value="AND">Ve</option>
+              <option value="OR">Veya</option>
+            </select>
+          </div>
+        </div>
         <div id="conds"></div>
-        <button class="btn" style="border-color:#3a3a42;color:#888780;font-size:11px;padding:4px 10px;margin-top:6px" onclick="addCond()">+ kosul ekle</button>
+        <button class="btn" style="font-size:11px;padding:6px 12px;margin-top:6px" onclick="addCond()">+ Kosul ekle</button>
       </div>
 
-      <div class="frow" style="border-top:1px solid #2e2e35;padding-top:10px;margin-top:10px">
-        <div><label>tp tipi</label><select id="f-tptype"><option value="pct">yuzde</option><option value="price">fiyat</option></select></div>
-        <div><label>tp degeri</label><input id="f-tpval" placeholder="10"></div>
-        <div><label>sl tipi</label><select id="f-sltype"><option value="pct">yuzde</option><option value="price">fiyat</option></select></div>
-        <div><label>sl degeri</label><input id="f-slval" placeholder="15"></div>
+      <div class="divider frow">
+        <div><label>TP tipi</label><select id="f-tptype" onchange="syncLevelUnits()"><option value="pct">Yuzde</option><option value="price">Fiyat</option></select></div>
+        <div><label>TP degeri</label><div class="cunit"><input id="f-tpval" placeholder="10"><span class="u" id="u-tp">%</span></div></div>
+        <div><label>SL tipi</label><select id="f-sltype" onchange="syncLevelUnits()"><option value="pct">Yuzde</option><option value="price">Fiyat</option></select></div>
+        <div><label>SL degeri</label><div class="cunit"><input id="f-slval" placeholder="15"><span class="u" id="u-sl">%</span></div></div>
       </div>
 
       <div class="frow">
-        <div><label>teminat (USDT)</label><input id="f-margin" placeholder="100"></div>
-        <div><label>kaldirac</label><input id="f-lev" placeholder="10"></div>
-        <div><label>gecerlilik (gun)</label><input id="f-days" placeholder="3"></div>
-        <div><label>not</label><input id="f-note" placeholder="opsiyonel"></div>
+        <div><label>Teminat</label><div class="cunit"><input id="f-margin" placeholder="100" style="padding-left:22px"><span class="u" style="left:10px;right:auto">$</span></div></div>
+        <div><label>Kaldirac</label><div class="cunit"><input id="f-lev" placeholder="10"><span class="u">x</span></div></div>
+        <div><label>Gecerlilik</label><div class="cunit"><input id="f-days" placeholder="3"><span class="u">gun</span></div></div>
+        <div><label>Not</label><input id="f-note" placeholder="Opsiyonel"></div>
       </div>
 
-      <div id="f-errors" style="display:none;background:#1e1010;border:1px solid #4a1b1b;border-radius:6px;padding:8px 10px;margin-top:10px;font-size:12px;color:#e24b4a"></div>
+      <div id="f-errors" class="errbox"></div>
 
-      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">
-        <button class="btn" style="border-color:#3a3a42;color:#888780" onclick="closeForm()">iptal</button>
-        <button class="btn btn-go" onclick="saveRule()" id="f-save">kaydet</button>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">
+        <button class="btn" onclick="closeForm()">Iptal</button>
+        <button class="btn btn-go" onclick="saveRule()" id="f-save">Kaydet</button>
       </div>
     </div>
   </div>
 
-  <div class="card"><div style="overflow-x:auto"><table id="rules">
-    <thead><tr><th>id</th><th>coin</th><th>yon</th><th>tf</th><th>kosullar</th><th>tp</th><th>sl</th><th>tem/kald</th><th>durum</th><th></th></tr></thead>
+  <p class="sect">Kayitli kurallar</p>
+  <div class="card"><div class="tw"><table id="rules">
+    <thead><tr><th>#</th><th>Coin</th><th>Yon</th><th>Periyot</th><th>Kosullar</th><th>TP</th><th>SL</th><th>Teminat</th><th>Durum</th><th></th></tr></thead>
     <tbody></tbody>
   </table></div></div>
 </div>
@@ -486,200 +610,295 @@ input:focus,select:focus{outline:none;border-color:#5f5e5a}
 <div id="toast"></div>
 
 <script>
-var state = null;
+var state=null, editingId=null;
 
-function show(name, el) {
+/* ---------- tema ---------- */
+function applyTheme(t){
+  document.documentElement.setAttribute('data-theme', t);
+  document.getElementById('theme-btn').innerHTML = (t==='dark') ? '&#9788;' : '&#9789;';
+  var m=document.querySelector('meta[name=theme-color]');
+  if(m) m.setAttribute('content', t==='dark' ? '#15140F' : '#F5F2EA');
+  try{localStorage.setItem('sts-theme',t)}catch(e){}
+}
+function toggleTheme(){
+  var cur=document.documentElement.getAttribute('data-theme')||'light';
+  applyTheme(cur==='dark'?'light':'dark');
+}
+(function(){
+  var saved=null;
+  try{saved=localStorage.getItem('sts-theme')}catch(e){}
+  if(!saved) saved = (window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';
+  applyTheme(saved);
+})();
+
+/* ---------- yardimcilar ---------- */
+function show(name, el){
   ['durum','islemler','olaylar','kurallar'].forEach(function(n){
-    document.getElementById('p-'+n).style.display = (n===name)?'':'none';
+    document.getElementById('p-'+n).style.display=(n===name)?'':'none';
   });
   document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('on')});
   el.classList.add('on');
 }
-
-function fmt(n, d) {
-  if (n===null||n===undefined||isNaN(n)) return '-';
-  return Number(n).toLocaleString('en-US',{maximumFractionDigits:d===undefined?2:d});
+function n(v,d){
+  if(v===null||v===undefined||v===''||isNaN(v))return null;
+  return Number(v);
 }
-
+function fmt(v,d){
+  var x=n(v); if(x===null)return '—';
+  return x.toLocaleString('en-US',{minimumFractionDigits:d===undefined?2:d,
+    maximumFractionDigits:d===undefined?2:d});
+}
+function usd(v,d){
+  var x=n(v); if(x===null)return '—';
+  return '$'+Math.abs(x).toLocaleString('en-US',{minimumFractionDigits:d===undefined?2:d,
+    maximumFractionDigits:d===undefined?2:d});
+}
+function sgn(v,d){
+  var x=n(v); if(x===null)return '—';
+  return (x<0?'-':'+')+usd(x,d).slice(1);
+}
+function pctTxt(v,d){
+  var x=n(v); if(x===null)return '';
+  return (x<0?'':'+')+fmt(x,d===undefined?2:d)+'%';
+}
+function cls(v){var x=n(v); return x===null?'mut':(x>0?'up':(x<0?'dn':'mut'))}
 function esc(s){var d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML}
-
-function toast(msg){
+function toast(m){
   var t=document.getElementById('toast');
-  t.textContent=msg; t.style.display='block';
-  setTimeout(function(){t.style.display='none'},2500);
+  t.textContent=m;t.style.display='block';
+  setTimeout(function(){t.style.display='none'},2400);
 }
 
-function render() {
-  if (!state) return;
-  var st = state.status || {};
+/* ---------- render ---------- */
+function render(){
+  if(!state)return;
+  var st=state.status||{};
 
   var mode=document.getElementById('mode');
-  if (st.testnet===false){mode.textContent='CANLI';mode.className='badge b-live';}
-  else {mode.textContent='testnet';mode.className='badge b-test';}
+  if(st.testnet===false){mode.textContent='CANLI';mode.className='badge b-live';}
+  else{mode.textContent='TESTNET';mode.className='badge b-test';}
 
-  var h=document.getElementById('health');
-  var age=state.status_age;
-  if (age!==null && age<90){h.textContent='executor aktif ('+age+'s)';h.className='badge b-ok';}
-  else if (age!==null){h.textContent='executor SESSIZ ('+age+'s)';h.className='badge b-off';}
-  else {h.textContent='status yok';h.className='badge b-off';}
+  var h=document.getElementById('health'), age=state.status_age;
+  if(age!==null&&age<90){h.textContent='Executor aktif ('+age+'s)';h.className='badge b-ok';}
+  else if(age!==null){h.textContent='Executor sessiz ('+age+'s)';h.className='badge b-off';}
+  else{h.textContent='Status yok';h.className='badge b-off';}
 
   var ks=state.killswitch;
-  document.getElementById('ks-state').textContent = ks?'KILL-SWITCH AKTIF':'';
+  var kss=document.getElementById('ks-state');
+  kss.style.display=ks?'':'none';
+  kss.textContent='Kill-switch aktif';
   var kb=document.getElementById('ks-btn');
-  kb.textContent = ks?'devam et':'durdur';
-  kb.className = ks?'btn btn-go':'btn btn-stop';
+  kb.textContent=ks?'Devam et':'Durdur';
+  kb.className=ks?'btn btn-go':'btn btn-stop';
 
-  document.getElementById('m-bal').textContent = fmt(st.balance,0);
-  document.getElementById('m-sig').textContent = (st.sig_count!=null?st.sig_count:'-')+' / '+(st.sig_max||'-');
-  document.getElementById('m-rule').textContent = (st.rule_count!=null?st.rule_count:'-')+' / '+(st.rule_max||'-');
+  document.getElementById('m-bal').textContent=usd(st.balance,0);
+  document.getElementById('m-sig').textContent=(st.sig_count!=null?st.sig_count:'—')+' / '+(st.sig_max||'—');
+  document.getElementById('m-rule').textContent=(st.rule_count!=null?st.rule_count:'—')+' / '+(st.rule_max||'—');
 
-  var pos = st.positions||[];
-  var upnl = 0, hasU=false;
-  pos.forEach(function(p){ if(p.upnl!=null){upnl+=Number(p.upnl);hasU=true;} });
+  var pos=st.positions||[], upnl=0, marginSum=0, hasU=false;
+  pos.forEach(function(p){
+    if(p.upnl!=null){upnl+=Number(p.upnl);hasU=true;}
+    if(p.margin!=null)marginSum+=Number(p.margin);
+  });
   var mu=document.getElementById('m-upnl');
-  mu.textContent = hasU?fmt(upnl):'-';
-  mu.className = 'v '+(upnl>0?'up':(upnl<0?'dn':'mut'));
+  mu.textContent=hasU?sgn(upnl):'—';
+  mu.className='v '+(hasU?cls(upnl):'mut');
+  document.getElementById('m-upnl-pct').textContent=
+    (hasU&&marginSum>0)?pctTxt(upnl/marginSum*100)+' teminata gore':'Anlik';
 
   var box=document.getElementById('positions');
-  if (!pos.length){box.innerHTML='<div class="empty">acik pozisyon yok</div>';}
-  else {
-    box.innerHTML = pos.map(function(p){
-      var u=Number(p.upnl||0);
-      return '<div class="pos">'
-        +'<div><span class="nm">'+esc(p.coin)+'</span> '
-        +'<span class="badge '+(p.side==='LONG'?'b-long':'b-short')+'">'+esc(p.side)+'</span> '
-        +'<span class="badge '+(p.source==='rule'?'b-rule':'b-sig')+'">'+(p.source==='rule'?'kural':'sinyal')+'</span>'
-        +'<div class="dt">giris '+fmt(p.entry,6)+' | mark '+fmt(p.mark,6)+' | tp '+fmt(p.tp,6)+' | sl '+fmt(p.sl,6)+' | '+(p.leverage||'-')+'x</div></div>'
-        +'<div class="pnl '+(u>0?'up':(u<0?'dn':'mut'))+'">'+fmt(u)+'</div>'
-        +'</div>';
+  if(!pos.length){box.innerHTML='<div class="empty">Acik pozisyon yok</div>';}
+  else{
+    box.innerHTML=pos.map(function(p){
+      var u=n(p.upnl), m=n(p.margin);
+      var pct=(u!==null&&m)?u/m*100:null;
+      return '<div class="pos"><div class="pos-l">'
+        +'<div class="pos-nm"><b>'+esc(p.coin)+'</b>'
+        +'<span class="badge '+(p.side==='LONG'?'b-long':'b-short')+'">'+esc(p.side||'')+'</span>'
+        +'<span class="badge '+(p.source==='rule'?'b-rule':'b-sig')+'">'+(p.source==='rule'?'Kural':'Sinyal')+'</span></div>'
+        +'<div class="pos-dt mono"><span>Giris</span> '+fmt(p.entry,6)
+        +' &nbsp;<span>Mark</span> '+fmt(p.mark,6)
+        +' &nbsp;<span>TP</span> '+fmt(p.tp,6)
+        +' &nbsp;<span>SL</span> '+fmt(p.sl,6)
+        +' &nbsp;<span>'+(p.leverage||'—')+'x</span>'
+        +(m?' &nbsp;<span>'+usd(m,0)+'</span>':'')
+        +'</div></div>'
+        +'<div class="pos-r"><div class="pnl '+cls(u)+'">'+sgn(u)+'</div>'
+        +(pct!==null?'<div class="pnl-pct '+cls(pct)+'">'+pctTxt(pct)+'</div>':'')
+        +'</div></div>';
     }).join('');
   }
 
+  /* islemler */
   var closed=(state.trades||[]).filter(function(t){return t.closed_at});
-  var pnlSum=0,win=0;
-  closed.forEach(function(t){var p=Number(t.pnl||0);pnlSum+=p;if(p>0)win++;});
+  var pnlSum=0,marSum=0,win=0;
+  closed.forEach(function(t){
+    var p=n(t.pnl)||0; pnlSum+=p; if(p>0)win++;
+    var m=n(t.margin_usdt); if(m)marSum+=m;
+  });
   document.getElementById('t-count').textContent=closed.length;
   var tp=document.getElementById('t-pnl');
-  tp.textContent=fmt(pnlSum); tp.className='v '+(pnlSum>0?'up':(pnlSum<0?'dn':'mut'));
-  document.getElementById('t-win').textContent = closed.length?Math.round(win/closed.length*100)+'%':'-';
+  tp.textContent=closed.length?sgn(pnlSum):'—';
+  tp.className='v '+cls(closed.length?pnlSum:null);
+  document.getElementById('t-pnl-pct').textContent=
+    marSum>0?pctTxt(pnlSum/marSum*100)+' teminata gore':'Teminata gore';
+  document.getElementById('t-win').textContent=closed.length?Math.round(win/closed.length*100)+'%':'—';
+  document.getElementById('t-win-sub').textContent=closed.length?(win+' / '+closed.length+' karli'):'Karli / toplam';
 
   var tb=document.querySelector('#trades tbody');
-  tb.innerHTML=(state.trades||[]).map(function(t){
-    var p=t.pnl==null?null:Number(t.pnl);
-    return '<tr><td>'+esc(t.coin)+'</td>'
+  var trades=state.trades||[];
+  tb.innerHTML=trades.length?trades.map(function(t){
+    var p=n(t.pnl), m=n(t.margin_usdt);
+    var pct=(p!==null&&m)?p/m*100:null;
+    return '<tr><td><b>'+esc(t.coin)+'</b></td>'
       +'<td><span class="badge '+(t.side==='LONG'?'b-long':'b-short')+'">'+esc(t.side||'')+'</span></td>'
-      +'<td>'+esc(t.source||'signal')+'</td>'
-      +'<td>'+fmt(t.entry_price,6)+'</td>'
-      +'<td>'+(t.closed_at?fmt(t.exit_price,6):'<span class="mut">acik</span>')+'</td>'
-      +'<td class="'+(p>0?'up':(p<0?'dn':''))+'">'+(p==null?'-':fmt(p))+'</td>'
-      +'<td>'+esc(t.exit_reason||'-')+'</td>'
-      +'<td class="mut">'+esc((t.opened_at||'').replace('T',' ').slice(5,16))+'</td></tr>';
-  }).join('');
+      +'<td><span class="badge '+(t.source==='rule'?'b-rule':'b-sig')+'">'+(t.source==='rule'?'Kural':'Sinyal')+'</span></td>'
+      +'<td class="mono">'+fmt(t.entry_price,6)+'</td>'
+      +'<td class="mono">'+(t.closed_at?fmt(t.exit_price,6):'<span class="mut">Acik</span>')+'</td>'
+      +'<td class="mono '+cls(p)+'"><b>'+(p===null?'—':sgn(p))+'</b>'
+        +(pct!==null?'<br><span style="font-size:10px">'+pctTxt(pct)+'</span>':'')+'</td>'
+      +'<td>'+esc(t.exit_reason||'—')+'</td>'
+      +'<td class="mut mono">'+esc((t.opened_at||'').replace('T',' ').slice(5,16))+'</td></tr>';
+  }).join(''):'<tr><td colspan="8" class="empty">Islem yok</td></tr>';
 
   var eb=document.querySelector('#events tbody');
-  eb.innerHTML=(state.events||[]).map(function(e){
-    return '<tr><td class="mut">'+esc((e.ts||'').replace('T',' ').slice(5,19))+'</td>'
-      +'<td>'+esc(e.kind)+'</td><td>'+esc(e.coin||'-')+'</td><td>'+esc(e.detail||'')+'</td></tr>';
-  }).join('');
+  var evs=state.events||[];
+  eb.innerHTML=evs.length?evs.map(function(e){
+    return '<tr><td class="mut mono">'+esc((e.ts||'').replace('T',' ').slice(5,19))+'</td>'
+      +'<td>'+esc(e.kind)+'</td><td><b>'+esc(e.coin||'—')+'</b></td>'
+      +'<td style="white-space:normal">'+esc(e.detail||'')+'</td></tr>';
+  }).join(''):'<tr><td colspan="4" class="empty">Olay yok</td></tr>';
 
   var rb=document.querySelector('#rules tbody');
-  rb.innerHTML=(state.rules||[]).map(function(r){
-    var st_= r.active?'<span class="badge b-ok">aktif</span>'
-           : (r.triggered_at?'<span class="badge b-rule">tetiklendi</span>':'<span class="badge b-off">pasif</span>');
-    return '<tr><td>'+r.id+'</td><td>'+esc(r.coin)+'</td>'
+  var rules=state.rules||[];
+  rb.innerHTML=rules.length?rules.map(function(r){
+    var stt=r.active?'<span class="badge b-ok">Aktif</span>'
+      :(r.triggered_at?'<span class="badge b-rule">Tetiklendi</span>':'<span class="badge b-off">Pasif</span>');
+    return '<tr><td class="mut">'+r.id+'</td><td><b>'+esc(r.coin)+'</b></td>'
       +'<td><span class="badge '+(r.direction==='LONG'?'b-long':'b-short')+'">'+esc(r.direction)+'</span></td>'
       +'<td>'+esc(r.timeframe)+'</td>'
-      +'<td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(condText(r.conditions,r.logic))+'</td>'
-      +'<td>'+fmtLevel(r.tp_type,r.tp_value)+'</td>'
-      +'<td>'+fmtLevel(r.sl_type,r.sl_value)+'</td>'
-      +'<td class="mut">'+fmt(r.margin_usdt,0)+'$ '+(r.leverage||'-')+'x</td>'
-      +'<td>'+st_+'</td>'
-      +'<td style="white-space:nowrap">'
-      +'<button class="mini" onclick="editRule('+r.id+')">duzenle</button>'
-      +'<button class="mini" onclick="toggleRule('+r.id+','+(!r.active)+')">'+(r.active?'pasif':'aktif')+'</button>'
-      +'<button class="mini del" onclick="delRule('+r.id+')">sil</button>'
+      +'<td class="mono" style="max-width:240px;overflow:hidden;text-overflow:ellipsis">'+esc(condText(r.conditions,r.logic))+'</td>'
+      +'<td class="mono">'+lvl(r.tp_type,r.tp_value)+'</td>'
+      +'<td class="mono">'+lvl(r.sl_type,r.sl_value)+'</td>'
+      +'<td class="mono mut">'+usd(r.margin_usdt,0)+' '+(r.leverage||'—')+'x</td>'
+      +'<td>'+stt+'</td>'
+      +'<td style="text-align:right">'
+      +'<button class="mini" onclick="editRule('+r.id+')">Duzenle</button>'
+      +'<button class="mini" onclick="toggleRule('+r.id+','+(!r.active)+')">'+(r.active?'Pasif':'Aktif')+'</button>'
+      +'<button class="mini del" onclick="delRule('+r.id+')">Sil</button>'
       +'</td></tr>';
-  }).join('');
+  }).join(''):'<tr><td colspan="10" class="empty">Kural yok</td></tr>';
 }
 
-// ---------- kural formu ----------
-var COND_LABELS={ema_cross:'ema kesisimi',rsi:'rsi',price:'fiyat',oi_change:'oi degisimi',volume:'hacim',funding:'funding'};
-var NEEDS_P1=['ema_cross','rsi','oi_change','volume'];
-var P1_HINT={ema_cross:'hizli',rsi:'periyot',oi_change:'mum',volume:'ort.mum'};
-var P2_HINT={ema_cross:'yavas',rsi:'esik',price:'fiyat',oi_change:'%',volume:'x',funding:'%'};
-var editingId=null;
+/* ---------- kosul tanimlari ---------- */
+var CT={
+  ema_cross:{ad:'EMA kesisimi', p1:'Hizli', p2:'Yavas', u1:'', u2:'', d1:7,  d2:30,  op:'<'},
+  rsi:      {ad:'RSI',           p1:'Periyot', p2:'Esik', u1:'', u2:'', d1:14, d2:35,  op:'<'},
+  price:    {ad:'Fiyat',         p1:null, p2:'Fiyat', u1:'', u2:'$', d1:null, d2:'',  op:'<'},
+  oi_change:{ad:'OI degisimi',   p1:'Mum', p2:'Degisim', u1:'', u2:'%', d1:3, d2:-5,  op:'<='},
+  volume:   {ad:'Hacim',         p1:'Ort. mum', p2:'Carpan', u1:'', u2:'x', d1:20, d2:3, op:'>='},
+  funding:  {ad:'Funding',       p1:null, p2:'Oran', u1:'', u2:'%', d1:null, d2:-0.05, op:'<'}
+};
 
 function condText(conds,logic){
   if(typeof conds==='string'){try{conds=JSON.parse(conds)}catch(e){return String(conds)}}
-  if(!conds||!conds.length)return '-';
-  return conds.map(function(c){
-    var t=COND_LABELS[c.type]||c.type;
-    if(c.type==='ema_cross')return 'ema'+c.p1+' '+c.op+' ema'+c.p2;
-    if(c.type==='rsi')return 'rsi'+c.p1+' '+c.op+' '+c.p2;
-    if(c.type==='oi_change')return 'oi('+c.p1+' mum) '+c.op+' '+c.p2+'%';
-    if(c.type==='volume')return 'hacim '+c.op+' '+c.p2+'x';
+  if(!conds||!conds.length)return '—';
+  var txt=conds.map(function(c){
+    var t=c.type;
+    if(t==='ema_cross')return 'EMA'+c.p1+' '+c.op+' EMA'+c.p2;
+    if(t==='rsi')return 'RSI'+c.p1+' '+c.op+' '+c.p2;
+    if(t==='oi_change')return 'OI('+c.p1+'mum) '+c.op+' '+c.p2+'%';
+    if(t==='volume')return 'Hacim '+c.op+' '+c.p2+'x';
+    if(t==='funding')return 'Funding '+c.op+' '+c.p2+'%';
+    if(t==='price')return 'Fiyat '+c.op+' $'+c.p2;
     return t+' '+c.op+' '+c.p2;
-  }).join(logic==='OR'?'  VEYA  ':'  VE  ');
+  });
+  if(txt.length===1)return txt[0];
+  return txt.join(logic==='OR'?'  VEYA  ':'  VE  ');
 }
-
-function fmtLevel(type,val){
-  if(val==null)return '-';
-  return type==='pct'?(fmt(val,2)+'%'):fmt(val,8);
+function lvl(type,val){
+  if(val==null)return '—';
+  return type==='pct'?(fmt(val,2)+'%'):('$'+fmt(val,8));
+}
+function syncLevelUnits(){
+  document.getElementById('u-tp').textContent=
+    document.getElementById('f-tptype').value==='pct'?'%':'$';
+  document.getElementById('u-sl').textContent=
+    document.getElementById('f-sltype').value==='pct'?'%':'$';
 }
 
 function condRow(c){
-  c=c||{type:'ema_cross',op:'<',p1:7,p2:30};
   var d=document.createElement('div');
   d.className='crow';
-  var opts=Object.keys(COND_LABELS).map(function(k){
-    return '<option value="'+k+'"'+(k===c.type?' selected':'')+'>'+COND_LABELS[k]+'</option>';
+  var t=(c&&c.type)||'ema_cross';
+  var opts=Object.keys(CT).map(function(k){
+    return '<option value="'+k+'"'+(k===t?' selected':'')+'>'+CT[k].ad+'</option>';
   }).join('');
   var ops=['<','>','<=','>='].map(function(o){
-    return '<option value="'+o+'"'+(o===c.op?' selected':'')+'>'+o+'</option>';
+    return '<option value="'+o+'"'+((c&&c.op===o)?' selected':'')+'>'+o+'</option>';
   }).join('');
-  d.innerHTML='<select class="c-type" onchange="syncCond(this)">'+opts+'</select>'
-    +'<input class="c-p1" value="'+(c.p1==null?'':c.p1)+'">'
+  d.innerHTML='<select class="c-type" onchange="onTypeChange(this)">'+opts+'</select>'
+    +'<div class="cunit"><input class="c-p1"><span class="u u1"></span></div>'
     +'<select class="c-op">'+ops+'</select>'
-    +'<input class="c-p2" value="'+(c.p2==null?'':c.p2)+'">'
-    +'<button class="xbtn" onclick="this.parentNode.remove()">x</button>';
+    +'<div class="cunit"><input class="c-p2"><span class="u u2"></span></div>'
+    +'<button class="xbtn" onclick="rmCond(this)" title="Kosulu sil">&times;</button>';
   return d;
 }
-
-function syncCond(sel){
-  var row=sel.parentNode, t=sel.value;
+function fillRow(row,c,useDefaults){
+  var t=row.querySelector('.c-type').value, def=CT[t];
   var p1=row.querySelector('.c-p1'), p2=row.querySelector('.c-p2');
-  var need=NEEDS_P1.indexOf(t)>=0;
-  p1.disabled=!need;
-  p1.placeholder=need?(P1_HINT[t]||''):'-';
-  if(!need)p1.value='';
-  p2.placeholder=P2_HINT[t]||'';
+  row.querySelector('.u1').textContent=def.u1;
+  row.querySelector('.u2').textContent=def.u2;
+  p1.disabled = def.p1===null;
+  p1.placeholder = def.p1===null?'—':def.p1;
+  p2.placeholder = def.p2;
+  if(useDefaults){
+    p1.value = def.p1===null?'':(def.d1===null?'':def.d1);
+    p2.value = def.d2===null?'':def.d2;
+    row.querySelector('.c-op').value=def.op;
+  }else if(c){
+    p1.value = (c.p1===null||c.p1===undefined)?'':c.p1;
+    p2.value = (c.p2===null||c.p2===undefined)?'':c.p2;
+  }
+  if(def.p1===null)p1.value='';
 }
-
+function onTypeChange(sel){ fillRow(sel.parentNode,null,true); }
 function addCond(c){
   var box=document.getElementById('conds');
   var row=condRow(c);
   box.appendChild(row);
-  syncCond(row.querySelector('.c-type'));
+  fillRow(row,c,!c);
+  syncLogic();
+}
+function rmCond(btn){
+  var rows=document.querySelectorAll('#conds .crow');
+  if(rows.length<=1){toast('En az bir kosul gerekli');return;}
+  btn.parentNode.remove();
+  syncLogic();
+}
+function syncLogic(){
+  var cnt=document.querySelectorAll('#conds .crow').length;
+  var sel=document.getElementById('f-logic');
+  if(cnt<=1){ sel.value='-'; sel.disabled=true; }
+  else{ sel.disabled=false; if(sel.value==='-')sel.value='AND'; }
 }
 
+/* ---------- form ---------- */
 function toggleForm(){
   var f=document.getElementById('rule-form');
-  if(f.style.display==='none'){openForm(null)}else{closeForm()}
+  if(f.style.display==='none')openForm(null);else closeForm();
 }
-
 function openForm(r){
-  editingId = r?r.id:null;
+  editingId=r?r.id:null;
   document.getElementById('rule-form').style.display='';
-  document.getElementById('form-toggle').textContent='kapat';
-  document.getElementById('form-title').textContent = r?('kural duzenle #'+r.id):'yeni kural';
+  document.getElementById('form-toggle').textContent='Kapat';
+  document.getElementById('form-title').textContent=r?('Kural duzenle #'+r.id):'Yeni kural';
   document.getElementById('f-errors').style.display='none';
-  var conds=document.getElementById('conds');
-  conds.innerHTML='';
+  document.getElementById('conds').innerHTML='';
   if(r){
     document.getElementById('f-coin').value=r.coin||'';
     document.getElementById('f-dir').value=r.direction||'SHORT';
     document.getElementById('f-tf').value=r.timeframe||'5m';
-    document.getElementById('f-logic').value=r.logic||'AND';
     document.getElementById('f-tptype').value=r.tp_type||'pct';
     document.getElementById('f-tpval').value=r.tp_value==null?'':r.tp_value;
     document.getElementById('f-sltype').value=r.sl_type||'pct';
@@ -692,117 +911,120 @@ function openForm(r){
     if(typeof cs==='string'){try{cs=JSON.parse(cs)}catch(e){cs=[]}}
     (cs||[]).forEach(function(c){addCond(c)});
     if(!cs||!cs.length)addCond();
+    document.getElementById('f-logic').value=(cs&&cs.length>1)?(r.logic||'AND'):'-';
   }else{
-    ['f-coin','f-tpval','f-slval','f-margin','f-lev','f-days','f-note'].forEach(function(id){
-      document.getElementById(id).value='';
-    });
+    ['f-coin','f-note','f-days'].forEach(function(id){document.getElementById(id).value=''});
     document.getElementById('f-dir').value='SHORT';
     document.getElementById('f-tf').value='5m';
-    document.getElementById('f-logic').value='AND';
     document.getElementById('f-tptype').value='pct';
+    document.getElementById('f-tpval').value='10';
     document.getElementById('f-sltype').value='pct';
+    document.getElementById('f-slval').value='15';
+    document.getElementById('f-margin').value='100';
+    document.getElementById('f-lev').value='10';
+    document.getElementById('f-days').value='3';
     addCond();
   }
+  syncLevelUnits();
+  syncLogic();
   document.getElementById('rule-form').scrollIntoView({behavior:'smooth',block:'nearest'});
 }
-
 function closeForm(){
   document.getElementById('rule-form').style.display='none';
-  document.getElementById('form-toggle').textContent='+ kural ekle';
-  document.getElementById('form-title').textContent='yeni kural';
+  document.getElementById('form-toggle').textContent='+ Kural ekle';
+  document.getElementById('form-title').textContent='Yeni kural';
   editingId=null;
 }
-
 function collectForm(){
   var conds=[];
   document.querySelectorAll('#conds .crow').forEach(function(row){
     conds.push({
-      type: row.querySelector('.c-type').value,
-      op:   row.querySelector('.c-op').value,
-      p1:   row.querySelector('.c-p1').value,
-      p2:   row.querySelector('.c-p2').value
+      type:row.querySelector('.c-type').value,
+      op:row.querySelector('.c-op').value,
+      p1:row.querySelector('.c-p1').value,
+      p2:row.querySelector('.c-p2').value
     });
   });
+  var lg=document.getElementById('f-logic').value;
   return {
-    coin: document.getElementById('f-coin').value,
-    direction: document.getElementById('f-dir').value,
-    timeframe: document.getElementById('f-tf').value,
-    logic: document.getElementById('f-logic').value,
-    conditions: conds,
-    tp_type: document.getElementById('f-tptype').value,
-    tp_value: document.getElementById('f-tpval').value,
-    sl_type: document.getElementById('f-sltype').value,
-    sl_value: document.getElementById('f-slval').value,
-    margin_usdt: document.getElementById('f-margin').value||100,
-    leverage: document.getElementById('f-lev').value||10,
-    expire_days: document.getElementById('f-days').value,
-    note: document.getElementById('f-note').value,
-    active: true
+    coin:document.getElementById('f-coin').value,
+    direction:document.getElementById('f-dir').value,
+    timeframe:document.getElementById('f-tf').value,
+    logic:lg,
+    conditions:conds,
+    tp_type:document.getElementById('f-tptype').value,
+    tp_value:document.getElementById('f-tpval').value,
+    sl_type:document.getElementById('f-sltype').value,
+    sl_value:document.getElementById('f-slval').value,
+    margin_usdt:document.getElementById('f-margin').value||100,
+    leverage:document.getElementById('f-lev').value||10,
+    expire_days:document.getElementById('f-days').value,
+    note:document.getElementById('f-note').value,
+    active:true
   };
 }
-
 function showErrors(list){
-  var box=document.getElementById('f-errors');
-  box.innerHTML=list.map(function(e){return '&bull; '+esc(e)}).join('<br>');
-  box.style.display='';
+  var b=document.getElementById('f-errors');
+  b.innerHTML=list.map(function(e){return '&bull; '+esc(e)}).join('<br>');
+  b.style.display='';
+  b.scrollIntoView({behavior:'smooth',block:'nearest'});
 }
-
 function saveRule(){
   var data=collectForm();
   var url=editingId?('/api/rules/'+editingId):'/api/rules';
   var method=editingId?'PATCH':'POST';
   var btn=document.getElementById('f-save');
-  btn.disabled=true; btn.textContent='kaydediliyor...';
+  btn.disabled=true;btn.textContent='Kaydediliyor...';
   fetch(url,{method:method,headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
     .then(function(r){return r.json().then(function(j){return {s:r.status,j:j}})})
     .then(function(res){
-      btn.disabled=false; btn.textContent='kaydet';
-      if(res.s===200&&res.j.ok){toast(editingId?'kural guncellendi':'kural eklendi');closeForm();refresh();}
-      else{showErrors(res.j.errors||['kaydedilemedi']);}
+      btn.disabled=false;btn.textContent='Kaydet';
+      if(res.s===200&&res.j.ok){toast(editingId?'Kural guncellendi':'Kural eklendi');closeForm();refresh();}
+      else showErrors(res.j.errors||['Kaydedilemedi']);
     }).catch(function(){
-      btn.disabled=false; btn.textContent='kaydet';
-      showErrors(['baglanti hatasi']);
+      btn.disabled=false;btn.textContent='Kaydet';
+      showErrors(['Baglanti hatasi']);
     });
 }
-
 function editRule(id){
   var r=(state.rules||[]).filter(function(x){return x.id===id})[0];
   if(r)openForm(r);
 }
-
 function toggleRule(id,active){
-  fetch('/api/rules/'+id+'/toggle',{method:'PATCH',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({active:active})})
-    .then(function(){toast(active?'kural aktif':'kural pasif');refresh();});
+  fetch('/api/rules/'+id+'/toggle',{method:'PATCH',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({active:active})})
+    .then(function(){toast(active?'Kural aktif':'Kural pasif');refresh();});
 }
-
 function delRule(id){
   if(!confirm('Kural #'+id+' silinsin mi?'))return;
-  fetch('/api/rules/'+id,{method:'DELETE'}).then(function(){toast('kural silindi');refresh();});
+  fetch('/api/rules/'+id,{method:'DELETE'}).then(function(){toast('Kural silindi');refresh();});
 }
 
-function refresh(){
-  fetch('/api/state').then(function(r){return r.json()}).then(function(d){
-    state=d; render();
-  }).catch(function(e){
-    document.getElementById('health').textContent='panel hatasi';
-  });
-}
-
+/* ---------- kill-switch ---------- */
 function toggleKs(){
   var ks=state&&state.killswitch;
   var action=ks?'/api/resume':'/api/stop';
-  var msg=ks?'Bot devam etsin mi?':'Yeni pozisyon acma DURDURULSUN mu? (acik pozisyonlar izlenmeye devam eder)';
+  var msg=ks?'Bot devam etsin mi?':'Yeni pozisyon acma DURDURULSUN mu?\\n(Acik pozisyonlar izlenmeye devam eder)';
   if(!confirm(msg))return;
-  fetch(action,{method:'POST'}).then(function(){toast(ks?'devam ediliyor':'durduruldu');refresh();});
+  fetch(action,{method:'POST'}).then(function(){toast(ks?'Devam ediliyor':'Durduruldu');refresh();});
 }
 
+/* ---------- yenileme ---------- */
+function refresh(){
+  fetch('/api/state').then(function(r){return r.json()}).then(function(d){
+    state=d;render();
+  }).catch(function(){
+    var h=document.getElementById('health');
+    h.textContent='Panel hatasi';h.className='badge b-off';
+  });
+}
 refresh();
 setInterval(refresh,10000);
 </script>
 </body>
 </html>
 """
+
 
 
 # ======================================================================
