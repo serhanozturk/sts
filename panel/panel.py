@@ -178,6 +178,107 @@ def _num(v):
         return None
 
 
+def validate_conditions(raw_conds, etiket=""):
+    """Kosul listesini dogrula. Doner: (temiz_liste, hata_listesi).
+    Giris kurallari ve dinamik cikis ayni dogrulamayi kullanir."""
+    err = []
+    on = (etiket + " ") if etiket else ""
+
+    if isinstance(raw_conds, str):
+        try:
+            raw_conds = json.loads(raw_conds)
+        except Exception:
+            return [], [on + "kosullar okunamadi"]
+    if not isinstance(raw_conds, list) or not raw_conds:
+        return [], [on + "en az bir kosul gerekli"]
+    if len(raw_conds) > 8:
+        err.append(on + "en fazla 8 kosul")
+
+    conds = []
+    for i, c in enumerate(raw_conds, 1):
+        if not isinstance(c, dict):
+            err.append(f"{on}kosul {i}: gecersiz")
+            continue
+        t = (c.get("type") or "").lower()
+        op = (c.get("op") or "").strip()
+        p1 = _num(c.get("p1"))
+        p2 = _num(c.get("p2"))
+        if t not in COND_TYPES:
+            err.append(f"{on}kosul {i}: tip gecersiz")
+            continue
+        if op not in OPS:
+            err.append(f"{on}kosul {i}: operator gecersiz")
+            continue
+        if p2 is None:
+            err.append(f"{on}kosul {i}: deger bos")
+            continue
+        if t in NEEDS_P1:
+            if p1 is None or p1 <= 0:
+                err.append(f"{on}kosul {i}: periyot/bar sayisi pozitif olmali")
+                continue
+            if p1 > 500:
+                err.append(f"{on}kosul {i}: periyot 500'den kucuk olmali")
+                continue
+        if t == "ema_cross" and (p2 <= 0 or p2 > 500):
+            err.append(f"{on}kosul {i}: yavas periyot 1-500 arasi olmali")
+            continue
+        if t == "rsi" and not (0 <= p2 <= 100):
+            err.append(f"{on}kosul {i}: rsi esigi 0-100 arasi olmali")
+            continue
+        # oi_change / volume: yon operatorde, deger pozitif saklanir
+        if t in ("oi_change", "volume"):
+            p2 = abs(p2)
+            if p2 == 0:
+                err.append(f"{on}kosul {i}: yuzde degeri 0 olamaz")
+                continue
+        conds.append({"type": t, "op": op,
+                      "p1": p1 if t in NEEDS_P1 else None, "p2": p2})
+
+    return conds, err
+
+
+def validate_dynamic(d, prefix, etiket):
+    """Dinamik TP/SL blogunu dogrula. Doner: (alan_dict, hata_listesi).
+    Pasifse sadece active=false doner."""
+    aktif = d.get(f"{prefix}_active")
+    aktif = str(aktif).strip().lower() in ("1", "true", "yes", "on") if not isinstance(aktif, bool) else aktif
+    if not aktif:
+        return {f"{prefix}_active": False}, []
+
+    err = []
+    out = {f"{prefix}_active": True}
+
+    tf = (d.get(f"{prefix}_timeframe") or "5m").lower()
+    if tf not in TIMEFRAMES:
+        err.append(f"{etiket}: periyot gecersiz")
+    else:
+        out[f"{prefix}_timeframe"] = tf
+
+    logic = (d.get(f"{prefix}_logic") or "AND").upper()
+    if logic == "-":
+        logic = "AND"
+    if logic not in ("AND", "OR"):
+        err.append(f"{etiket}: mantik AND veya OR olmali")
+    else:
+        out[f"{prefix}_logic"] = logic
+
+    mode = (d.get(f"{prefix}_mode") or "OR").upper()
+    if mode not in ("AND", "OR"):
+        err.append(f"{etiket}: hard/dinamik iliskisi AND veya OR olmali")
+    else:
+        out[f"{prefix}_mode"] = mode
+
+    conds, cerr = validate_conditions(d.get(f"{prefix}_conditions"), etiket)
+    if cerr:
+        err += cerr
+    else:
+        out[f"{prefix}_conditions"] = conds
+
+    if err:
+        return None, err
+    return out, []
+
+
 def validate_rule(d):
     """Panelden gelen kurali dogrula. Doner: (temiz_dict | None, hata_listesi)."""
     err = []
@@ -200,55 +301,8 @@ def validate_rule(d):
     if logic not in ("AND", "OR"):
         err.append("mantik AND veya OR olmali")
 
-    raw_conds = d.get("conditions") or []
-    if isinstance(raw_conds, str):
-        try:
-            raw_conds = json.loads(raw_conds)
-        except Exception:
-            err.append("kosullar okunamadi")
-            raw_conds = []
-    if not isinstance(raw_conds, list) or not raw_conds:
-        err.append("en az bir kosul gerekli")
-        raw_conds = []
-    if len(raw_conds) > 8:
-        err.append("en fazla 8 kosul")
-
-    conds = []
-    for i, c in enumerate(raw_conds, 1):
-        t = (c.get("type") or "").lower()
-        op = (c.get("op") or "").strip()
-        p1 = _num(c.get("p1"))
-        p2 = _num(c.get("p2"))
-        if t not in COND_TYPES:
-            err.append(f"kosul {i}: tip gecersiz")
-            continue
-        if op not in OPS:
-            err.append(f"kosul {i}: operator gecersiz")
-            continue
-        if p2 is None:
-            err.append(f"kosul {i}: deger bos")
-            continue
-        if t in NEEDS_P1:
-            if p1 is None or p1 <= 0:
-                err.append(f"kosul {i}: periyot/mum sayisi pozitif olmali")
-                continue
-            if p1 > 500:
-                err.append(f"kosul {i}: periyot 500'den kucuk olmali")
-                continue
-        if t == "ema_cross" and (p2 is None or p2 <= 0 or p2 > 500):
-            err.append(f"kosul {i}: yavas periyot 1-500 arasi olmali")
-            continue
-        if t == "rsi" and not (0 <= p2 <= 100):
-            err.append(f"kosul {i}: rsi esigi 0-100 arasi olmali")
-            continue
-        # oi_change / volume: yon operatorde, deger her zaman pozitif saklanir
-        if t in ("oi_change", "volume"):
-            p2 = abs(p2)
-            if p2 == 0:
-                err.append(f"kosul {i}: yuzde degeri 0 olamaz")
-                continue
-        conds.append({"type": t, "op": op,
-                      "p1": p1 if t in NEEDS_P1 else None, "p2": p2})
+    conds, cerr = validate_conditions(d.get("conditions"))
+    err += cerr
 
     tp_type = (d.get("tp_type") or "pct").lower()
     sl_type = (d.get("sl_type") or "pct").lower()
@@ -281,12 +335,22 @@ def validate_rule(d):
     if days and days > 0:
         expires_at = (datetime.now(timezone.utc) + timedelta(days=min(days, 365))).isoformat()
 
+    # dinamik cikis bloklari (opsiyonel)
+    dyn = {}
+    for prefix, etiket in (("dyn_tp", "Dinamik TP"), ("dyn_sl", "Dinamik SL")):
+        blok, derr = validate_dynamic(d, prefix, etiket)
+        if derr:
+            err += derr
+        elif blok:
+            dyn.update(blok)
+
     if err:
         return None, err
 
     return {
         "coin": coin, "direction": direction, "timeframe": tf,
         "conditions": conds, "logic": logic,
+        **dyn,
         "tp_type": tp_type, "tp_value": tp_value,
         "sl_type": sl_type, "sl_value": sl_value,
         "margin_usdt": margin, "leverage": lev,
@@ -401,6 +465,16 @@ def validate_settings(d):
             err.append("Sinyal tipi cok uzun")
         else:
             clean["signal_types"] = ",".join(types)
+
+    # dinamik cikis bloklari (sinyal havuzu icin)
+    for prefix, etiket in (("dyn_tp", "Dinamik TP"), ("dyn_sl", "Dinamik SL")):
+        if f"{prefix}_active" not in d:
+            continue
+        blok, derr = validate_dynamic(d, prefix, etiket)
+        if derr:
+            err += derr
+        elif blok:
+            clean.update(blok)
 
     # tutarlilik: TP/SL mantigi
     if clean.get("tp_pct") is not None and clean["tp_pct"] >= 100:
@@ -567,6 +641,15 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
 .mini:hover{border-color:var(--text2);color:var(--text)}
 .mini.del:hover{border-color:var(--coralBd);color:var(--coral);background:var(--coralBg)}
 .divider{border-top:1px solid var(--border);padding-top:12px;margin-top:12px}
+.dynbox{background:var(--bg);border:1px solid var(--border);border-radius:11px;
+  padding:12px 14px;margin-bottom:10px}
+.dynhead{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.dynhint{font-size:11px;color:var(--text3)}
+.chk{display:flex;align-items:center;gap:8px;cursor:pointer;margin:0}
+.chk input{width:16px;height:16px;accent-color:var(--green);cursor:pointer}
+.chk span{font-size:13px;font-weight:600;color:var(--text)}
+.warnbox{background:var(--amberBg);border:1px solid var(--amber);border-radius:9px;
+  padding:10px 12px;margin-top:10px;font-size:11px;color:var(--amber);line-height:1.5}
 .errbox{display:none;background:var(--coralBg);border:1px solid var(--coralBd);
   border-radius:9px;padding:11px 13px;margin-top:12px;font-size:12px;color:var(--coral)}
 #toast{position:fixed;bottom:18px;right:18px;background:var(--text);color:var(--bg);
@@ -671,7 +754,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
         </div>
         <div id="conds"></div>
         <div style="display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap">
-          <button class="btn" style="font-size:11px;padding:6px 12px" onclick="addCond()">+ Kosul ekle</button>
+          <button class="btn" style="font-size:11px;padding:6px 12px" onclick="addCond('conds')">+ Kosul ekle</button>
           <span style="font-size:11px;color:var(--text3)">OI ve Hacim: son bar, onceki N barin ortalamasina gore karsilastirilir. Yonu operator belirler, eksi isareti gerekmez.</span>
         </div>
       </div>
@@ -688,6 +771,72 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
         <div><label>Kaldirac</label><div class="cunit"><input id="f-lev" placeholder="10"><span class="u">x</span></div></div>
         <div><label>Gecerlilik</label><div class="cunit"><input id="f-days" placeholder="3"><span class="u">gun</span></div></div>
         <div><label>Not</label><input id="f-note" placeholder="Opsiyonel"></div>
+      </div>
+
+      <div class="divider">
+        <p class="sect" style="margin-bottom:2px">Dinamik cikis (opsiyonel)</p>
+        <p style="font-size:11px;color:var(--text3);margin-bottom:10px">
+          Hard TP/SL Binance'te emir olarak durur. Dinamik cikis ise kosul saglaninca
+          botun pozisyonu kapatmasidir. Giris kurallariyla ayni kosul tipleri kullanilir.
+        </p>
+      <div class="dynbox">
+        <div class="dynhead">
+          <label class="chk"><input type="checkbox" id="dtp-active" onchange="dynToggle('dtp')"><span>Dinamik TP</span></label>
+          <span class="dynhint">Kar tarafi cikis kosulu</span>
+        </div>
+        <div id="dtp-body" style="display:none">
+          <div class="frow" style="margin-top:10px">
+            <div><label>Periyot</label><select id="dtp-tf">
+              <option value="5m">5m</option><option value="15m">15m</option><option value="30m">30m</option>
+              <option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
+            </select></div>
+            <div><label>Hard ile iliski</label><select id="dtp-mode" onchange="dynModeWarn('dtp')">
+              <option value="OR">VEYA - hangisi once gelirse</option>
+              <option value="AND">VE - ikisi birden gerekli</option>
+            </select></div>
+            <div><label>Kosul mantigi</label><select id="dtp-logic">
+              <option value="-">&#8212; (tek kural)</option>
+              <option value="AND">Ve</option>
+              <option value="OR">Veya</option>
+            </select></div>
+          </div>
+          <div id="dtp-conds"></div>
+          <button class="btn" style="font-size:11px;padding:6px 12px;margin-top:6px" onclick="addCond('dtp-conds')">+ Kosul ekle</button>
+          <div id="dtp-warn" class="warnbox" style="display:none">
+            <b>VE modu uyarisi:</b> Bu modda hard seviye Binance'e emir olarak GONDERILMEZ,
+            bot her iki kosulu birlikte izler. Bot durursa bu koruma da durur.
+          </div>
+        </div>
+      </div>
+      <div class="dynbox">
+        <div class="dynhead">
+          <label class="chk"><input type="checkbox" id="dsl-active" onchange="dynToggle('dsl')"><span>Dinamik SL</span></label>
+          <span class="dynhint">Zarar tarafi cikis kosulu</span>
+        </div>
+        <div id="dsl-body" style="display:none">
+          <div class="frow" style="margin-top:10px">
+            <div><label>Periyot</label><select id="dsl-tf">
+              <option value="5m">5m</option><option value="15m">15m</option><option value="30m">30m</option>
+              <option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
+            </select></div>
+            <div><label>Hard ile iliski</label><select id="dsl-mode" onchange="dynModeWarn('dsl')">
+              <option value="OR">VEYA - hangisi once gelirse</option>
+              <option value="AND">VE - ikisi birden gerekli</option>
+            </select></div>
+            <div><label>Kosul mantigi</label><select id="dsl-logic">
+              <option value="-">&#8212; (tek kural)</option>
+              <option value="AND">Ve</option>
+              <option value="OR">Veya</option>
+            </select></div>
+          </div>
+          <div id="dsl-conds"></div>
+          <button class="btn" style="font-size:11px;padding:6px 12px;margin-top:6px" onclick="addCond('dsl-conds')">+ Kosul ekle</button>
+          <div id="dsl-warn" class="warnbox" style="display:none">
+            <b>VE modu uyarisi:</b> Bu modda hard seviye Binance'e emir olarak GONDERILMEZ,
+            bot her iki kosulu birlikte izler. Bot durursa bu koruma da durur.
+          </div>
+        </div>
+      </div>
       </div>
 
       <div id="f-errors" class="errbox"></div>
@@ -758,6 +907,72 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
       <div><label>Kural min serbest bakiye</label><div class="cunit"><input id="s-minfree" style="padding-left:22px"><span class="u" style="left:10px;right:auto">$</span></div></div>
       <div><label>Tarama araligi</label><div class="cunit"><input id="s-poll"><span class="u">sn</span></div></div>
     </div>
+  </div>
+
+  <div class="card">
+    <p class="sect">Sinyal havuzu dinamik cikisi</p>
+    <p style="font-size:11px;color:var(--text3);margin-bottom:10px">
+      Screener sinyaliyle acilan pozisyonlar icin gecerlidir. Pozisyon acilirken
+      bu yapilandirma dondurulur; sonradan degistirmen acik pozisyonlari etkilemez.
+    </p>
+      <div class="dynbox">
+        <div class="dynhead">
+          <label class="chk"><input type="checkbox" id="stp-active" onchange="dynToggle('stp')"><span>Dinamik TP</span></label>
+          <span class="dynhint">Kar tarafi cikis kosulu</span>
+        </div>
+        <div id="stp-body" style="display:none">
+          <div class="frow" style="margin-top:10px">
+            <div><label>Periyot</label><select id="stp-tf">
+              <option value="5m">5m</option><option value="15m">15m</option><option value="30m">30m</option>
+              <option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
+            </select></div>
+            <div><label>Hard ile iliski</label><select id="stp-mode" onchange="dynModeWarn('stp')">
+              <option value="OR">VEYA - hangisi once gelirse</option>
+              <option value="AND">VE - ikisi birden gerekli</option>
+            </select></div>
+            <div><label>Kosul mantigi</label><select id="stp-logic">
+              <option value="-">&#8212; (tek kural)</option>
+              <option value="AND">Ve</option>
+              <option value="OR">Veya</option>
+            </select></div>
+          </div>
+          <div id="stp-conds"></div>
+          <button class="btn" style="font-size:11px;padding:6px 12px;margin-top:6px" onclick="addCond('stp-conds')">+ Kosul ekle</button>
+          <div id="stp-warn" class="warnbox" style="display:none">
+            <b>VE modu uyarisi:</b> Bu modda hard seviye Binance'e emir olarak GONDERILMEZ,
+            bot her iki kosulu birlikte izler. Bot durursa bu koruma da durur.
+          </div>
+        </div>
+      </div>
+      <div class="dynbox">
+        <div class="dynhead">
+          <label class="chk"><input type="checkbox" id="ssl-active" onchange="dynToggle('ssl')"><span>Dinamik SL</span></label>
+          <span class="dynhint">Zarar tarafi cikis kosulu</span>
+        </div>
+        <div id="ssl-body" style="display:none">
+          <div class="frow" style="margin-top:10px">
+            <div><label>Periyot</label><select id="ssl-tf">
+              <option value="5m">5m</option><option value="15m">15m</option><option value="30m">30m</option>
+              <option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
+            </select></div>
+            <div><label>Hard ile iliski</label><select id="ssl-mode" onchange="dynModeWarn('ssl')">
+              <option value="OR">VEYA - hangisi once gelirse</option>
+              <option value="AND">VE - ikisi birden gerekli</option>
+            </select></div>
+            <div><label>Kosul mantigi</label><select id="ssl-logic">
+              <option value="-">&#8212; (tek kural)</option>
+              <option value="AND">Ve</option>
+              <option value="OR">Veya</option>
+            </select></div>
+          </div>
+          <div id="ssl-conds"></div>
+          <button class="btn" style="font-size:11px;padding:6px 12px;margin-top:6px" onclick="addCond('ssl-conds')">+ Kosul ekle</button>
+          <div id="ssl-warn" class="warnbox" style="display:none">
+            <b>VE modu uyarisi:</b> Bu modda hard seviye Binance'e emir olarak GONDERILMEZ,
+            bot her iki kosulu birlikte izler. Bot durursa bu koruma da durur.
+          </div>
+        </div>
+      </div>
   </div>
 
   <div id="s-errors" class="errbox"></div>
@@ -945,8 +1160,8 @@ function render(){
       +'<td><span class="badge '+(r.direction==='LONG'?'b-long':'b-short')+'">'+esc(r.direction)+'</span></td>'
       +'<td>'+esc(r.timeframe)+'</td>'
       +'<td class="mono" style="max-width:240px;overflow:hidden;text-overflow:ellipsis">'+esc(condText(r.conditions,r.logic))+'</td>'
-      +'<td class="mono">'+lvl(r.tp_type,r.tp_value)+'</td>'
-      +'<td class="mono">'+lvl(r.sl_type,r.sl_value)+'</td>'
+      +'<td class="mono">'+lvl(r.tp_type,r.tp_value)+dynBadge(r,'tp')+'</td>'
+      +'<td class="mono">'+lvl(r.sl_type,r.sl_value)+dynBadge(r,'sl')+'</td>'
       +'<td class="mono mut">'+usd(r.margin_usdt,0)+' '+(r.leverage||'—')+'x</td>'
       +'<td>'+stt+'</td>'
       +'<td style="text-align:right">'
@@ -975,12 +1190,16 @@ function fillSettings(){
     var v=st[S_MAP[id]];
     el.value=(v===null||v===undefined)?'':v;
   });
+  dynFill('stp',{active:st.dyn_tp_active,timeframe:st.dyn_tp_timeframe,
+    mode:st.dyn_tp_mode,logic:st.dyn_tp_logic,conditions:st.dyn_tp_conditions});
+  dynFill('ssl',{active:st.dyn_sl_active,timeframe:st.dyn_sl_timeframe,
+    mode:st.dyn_sl_mode,logic:st.dyn_sl_logic,conditions:st.dyn_sl_conditions});
   settingsDirty=false;
   document.getElementById('s-errors').style.display='none';
 }
 
 function saveSettings(){
-  var body={};
+  var body=Object.assign({}, dynRead('stp','dyn_tp'), dynRead('ssl','dyn_sl'));
   Object.keys(S_MAP).forEach(function(id){
     var el=document.getElementById(id);
     if(el) body[S_MAP[id]]=el.value;
@@ -999,12 +1218,12 @@ function saveSettings(){
       }else{
         var b=document.getElementById('s-errors');
         b.innerHTML=(res.j.errors||['Kaydedilemedi']).map(function(e){return '&bull; '+esc(e)}).join('<br>');
-        b.style.display='';
+        b.style.display='block';
       }
     }).catch(function(){
       btn.disabled=false;btn.textContent='Kaydet';
       var b=document.getElementById('s-errors');
-      b.innerHTML='&bull; Baglanti hatasi';b.style.display='';
+      b.innerHTML='&bull; Baglanti hatasi';b.style.display='block';
     });
 }
 
@@ -1027,10 +1246,10 @@ function importJson(){
   var raw=document.getElementById('f-json').value.trim();
   var box=document.getElementById('json-errors');
   box.style.display='none';
-  if(!raw){box.innerHTML='&bull; JSON bos';box.style.display='';return;}
+  if(!raw){box.innerHTML='&bull; JSON bos';box.style.display='block';return;}
   var data;
   try{ data=JSON.parse(raw); }
-  catch(e){ box.innerHTML='&bull; JSON gecersiz: '+esc(e.message);box.style.display='';return; }
+  catch(e){ box.innerHTML='&bull; JSON gecersiz: '+esc(e.message);box.style.display='block';return; }
   var btn=document.getElementById('json-save');
   btn.disabled=true;btn.textContent='Ekleniyor...';
   fetch('/api/rules/import',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -1044,11 +1263,11 @@ function importJson(){
         toggleJson();refresh();
       }else{
         box.innerHTML=(res.j.errors||['Eklenemedi']).map(function(e){return '&bull; '+esc(e)}).join('<br>');
-        box.style.display='';
+        box.style.display='block';
       }
     }).catch(function(){
       btn.disabled=false;btn.textContent='Ekle';
-      box.innerHTML='&bull; Baglanti hatasi';box.style.display='';
+      box.innerHTML='&bull; Baglanti hatasi';box.style.display='block';
     });
 }
 
@@ -1080,6 +1299,16 @@ function condText(conds,logic){
   if(txt.length===1)return txt[0];
   return txt.join(logic==='OR'?'  VEYA  ':'  VE  ');
 }
+function dynBadge(r,which){
+  if(!r['dyn_'+which+'_active'])return '';
+  var mode=(r['dyn_'+which+'_mode']||'OR').toUpperCase();
+  var tf=r['dyn_'+which+'_timeframe']||'';
+  var cls=(mode==='AND')?'b-test':'b-rule';
+  var ipucu=condText(r['dyn_'+which+'_conditions'], r['dyn_'+which+'_logic']);
+  return '<br><span class="badge '+cls+'" title="'+esc(tf+' | '+ipucu)+'">'
+    +(mode==='AND'?'+VE ':'+VEYA ')+esc(tf)+'</span>';
+}
+
 function lvl(type,val){
   if(val==null)return '—';
   return type==='pct'?(fmt(val,2)+'%'):('$'+fmt(val,8));
@@ -1129,24 +1358,88 @@ function fillRow(row,c,useDefaults){
   if(tek)p1.value='';
 }
 function onTypeChange(sel){ fillRow(sel.parentNode,null,true); }
-function addCond(c){
-  var box=document.getElementById('conds');
+/* kosul kutulari: giris ('conds'), dinamik TP ('dtp-conds'), dinamik SL ('dsl-conds') */
+var LOGIC_OF={'conds':'f-logic','dtp-conds':'dtp-logic','dsl-conds':'dsl-logic',
+  'stp-conds':'stp-logic','ssl-conds':'ssl-logic'};
+
+function addCond(boxId,c){
+  boxId=boxId||'conds';
+  var box=document.getElementById(boxId);
   var row=condRow(c);
+  row.dataset.box=boxId;
   box.appendChild(row);
   fillRow(row,c,!c);
-  syncLogic();
+  syncLogic(boxId);
 }
 function rmCond(btn){
-  var rows=document.querySelectorAll('#conds .crow');
+  var row=btn.parentNode;
+  var boxId=row.dataset.box||'conds';
+  var rows=document.querySelectorAll('#'+boxId+' .crow');
   if(rows.length<=1){toast('En az bir kosul gerekli');return;}
-  btn.parentNode.remove();
-  syncLogic();
+  row.remove();
+  syncLogic(boxId);
 }
-function syncLogic(){
-  var cnt=document.querySelectorAll('#conds .crow').length;
-  var sel=document.getElementById('f-logic');
+function syncLogic(boxId){
+  boxId=boxId||'conds';
+  var cnt=document.querySelectorAll('#'+boxId+' .crow').length;
+  var sel=document.getElementById(LOGIC_OF[boxId]);
+  if(!sel)return;
   if(cnt<=1){ sel.value='-'; sel.disabled=true; }
   else{ sel.disabled=false; if(sel.value==='-')sel.value='AND'; }
+}
+function readConds(boxId){
+  var out=[];
+  document.querySelectorAll('#'+boxId+' .crow').forEach(function(row){
+    out.push({type:row.querySelector('.c-type').value,
+              op:row.querySelector('.c-op').value,
+              p1:row.querySelector('.c-p1').value,
+              p2:row.querySelector('.c-p2').value});
+  });
+  return out;
+}
+
+/* dinamik blok yardimcilari: on = 'dtp' | 'dsl' */
+function dynToggle(on){
+  var acik=document.getElementById(on+'-active').checked;
+  document.getElementById(on+'-body').style.display=acik?'':'none';
+  dynModeWarn(on);
+}
+function dynModeWarn(on){
+  var mode=document.getElementById(on+'-mode').value;
+  var aktif=document.getElementById(on+'-active').checked;
+  var w=document.getElementById(on+'-warn');
+  var goster = aktif && mode==='AND';
+  w.style.display = goster?'block':'none';
+}
+function dynFill(on,cfg){
+  var act=document.getElementById(on+'-active');
+  var boxId=on+'-conds';
+  var box=document.getElementById(boxId);
+  box.innerHTML='';
+  var aktif=!!(cfg&&cfg.active);
+  act.checked=aktif;
+  document.getElementById(on+'-tf').value=(cfg&&cfg.timeframe)||'5m';
+  document.getElementById(on+'-mode').value=(cfg&&cfg.mode)||'OR';
+  document.getElementById(on+'-logic').value=(cfg&&cfg.logic)||'AND';
+  var cs=cfg&&cfg.conditions;
+  if(typeof cs==='string'){try{cs=JSON.parse(cs)}catch(e){cs=null}}
+  if(cs&&cs.length){ cs.forEach(function(c){addCond(boxId,c)}); }
+  else { addCond(boxId); }
+  document.getElementById(on+'-logic').value=(cs&&cs.length>1)?((cfg&&cfg.logic)||'AND'):'-';
+  syncLogic(boxId);
+  dynToggle(on);
+}
+function dynRead(on,prefix){
+  var o={};
+  var aktif=document.getElementById(on+'-active').checked;
+  o[prefix+'_active']=aktif;
+  if(aktif){
+    o[prefix+'_timeframe']=document.getElementById(on+'-tf').value;
+    o[prefix+'_mode']=document.getElementById(on+'-mode').value;
+    o[prefix+'_logic']=document.getElementById(on+'-logic').value;
+    o[prefix+'_conditions']=readConds(on+'-conds');
+  }
+  return o;
 }
 
 /* ---------- form ---------- */
@@ -1175,9 +1468,13 @@ function openForm(r){
     document.getElementById('f-note').value=r.note||'';
     var cs=r.conditions;
     if(typeof cs==='string'){try{cs=JSON.parse(cs)}catch(e){cs=[]}}
-    (cs||[]).forEach(function(c){addCond(c)});
-    if(!cs||!cs.length)addCond();
+    (cs||[]).forEach(function(c){addCond('conds',c)});
+    if(!cs||!cs.length)addCond('conds');
     document.getElementById('f-logic').value=(cs&&cs.length>1)?(r.logic||'AND'):'-';
+    dynFill('dtp',{active:r.dyn_tp_active,timeframe:r.dyn_tp_timeframe,
+      mode:r.dyn_tp_mode,logic:r.dyn_tp_logic,conditions:r.dyn_tp_conditions});
+    dynFill('dsl',{active:r.dyn_sl_active,timeframe:r.dyn_sl_timeframe,
+      mode:r.dyn_sl_mode,logic:r.dyn_sl_logic,conditions:r.dyn_sl_conditions});
   }else{
     ['f-coin','f-note','f-days'].forEach(function(id){document.getElementById(id).value=''});
     document.getElementById('f-dir').value='SHORT';
@@ -1189,10 +1486,12 @@ function openForm(r){
     document.getElementById('f-margin').value='100';
     document.getElementById('f-lev').value='10';
     document.getElementById('f-days').value='3';
-    addCond();
+    addCond('conds');
+    dynFill('dtp',null);
+    dynFill('dsl',null);
   }
   syncLevelUnits();
-  syncLogic();
+  syncLogic('conds');
   document.getElementById('rule-form').scrollIntoView({behavior:'smooth',block:'nearest'});
 }
 function closeForm(){
@@ -1202,17 +1501,9 @@ function closeForm(){
   editingId=null;
 }
 function collectForm(){
-  var conds=[];
-  document.querySelectorAll('#conds .crow').forEach(function(row){
-    conds.push({
-      type:row.querySelector('.c-type').value,
-      op:row.querySelector('.c-op').value,
-      p1:row.querySelector('.c-p1').value,
-      p2:row.querySelector('.c-p2').value
-    });
-  });
+  var conds=readConds('conds');
   var lg=document.getElementById('f-logic').value;
-  return {
+  return Object.assign({}, dynRead('dtp','dyn_tp'), dynRead('dsl','dyn_sl'), {
     coin:document.getElementById('f-coin').value,
     direction:document.getElementById('f-dir').value,
     timeframe:document.getElementById('f-tf').value,
@@ -1227,12 +1518,12 @@ function collectForm(){
     expire_days:document.getElementById('f-days').value,
     note:document.getElementById('f-note').value,
     active:true
-  };
+  });
 }
 function showErrors(list){
   var b=document.getElementById('f-errors');
   b.innerHTML=list.map(function(e){return '&bull; '+esc(e)}).join('<br>');
-  b.style.display='';
+  b.style.display='block';
   b.scrollIntoView({behavior:'smooth',block:'nearest'});
 }
 function saveRule(){
@@ -1287,6 +1578,14 @@ function refresh(){
 Object.keys(S_MAP).forEach(function(id){
   var el=document.getElementById(id);
   if(el)el.addEventListener('input',function(){settingsDirty=true;});
+});
+['stp','ssl'].forEach(function(on){
+  ['-active','-tf','-mode','-logic'].forEach(function(sfx){
+    var el=document.getElementById(on+sfx);
+    if(el)el.addEventListener('change',function(){settingsDirty=true;});
+  });
+  var box=document.getElementById(on+'-conds');
+  if(box)box.addEventListener('input',function(){settingsDirty=true;});
 });
 
 refresh();
