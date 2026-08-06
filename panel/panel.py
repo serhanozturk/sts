@@ -656,7 +656,7 @@ function usd(v,d){
 }
 function sgn(v,d){
   var x=n(v); if(x===null)return '—';
-  return (x<0?'-':'+')+usd(x,d).slice(1);
+  return (x<0?'-':'+')+usd(x,d);
 }
 function pctTxt(v,d){
   var x=n(v); if(x===null)return '';
