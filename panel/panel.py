@@ -53,6 +53,7 @@ SUPABASE_URL = (os.environ.get("SUPABASE_URL", "") or "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 PANEL_BIND   = os.environ.get("PANEL_BIND", "127.0.0.1")
 PANEL_PORT   = int(os.environ.get("PANEL_PORT", "8080"))
+WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
 PANEL_USER   = os.environ.get("PANEL_USER", "")
 PANEL_PASS   = os.environ.get("PANEL_PASS", "")
 AUTH_ON      = bool(PANEL_USER and PANEL_PASS)
@@ -378,6 +379,8 @@ def gather_state():
     stg = sb_get("sts_settings?id=eq.1&limit=1")
     settings = stg[0] if stg else None
 
+    webhooks = sb_get("sts_webhooks?order=id.desc&limit=30") or []
+
     trades = sb_get("bot_trades?order=id.desc&limit=100") or []
     events = sb_get("sts_events?order=id.desc&limit=100") or []
     rules  = sb_get("sts_rules?order=id.desc&limit=50") or []
@@ -387,6 +390,8 @@ def gather_state():
         "status_age": round(status_age) if status_age is not None else None,
         "killswitch": killswitch,
         "settings": settings,
+        "webhooks": webhooks,
+        "webhook_enabled": bool(WEBHOOK_TOKEN),
         "trades": trades,
         "events": events,
         "rules": rules,
@@ -395,11 +400,85 @@ def gather_state():
 
 
 # ======================================================================
+# WEBHOOK
+# ======================================================================
+
+WH_OPT_FIELDS = {
+    "margin_usdt": (float, 1, 100000),
+    "leverage":    (int, 1, 125),
+    "tp_value":    (float, 0.00000001, 10000000),
+    "sl_value":    (float, 0.00000001, 10000000),
+}
+
+
+def validate_webhook(d):
+    """TradingView'den gelen payload'i dogrula.
+    Doner: (temiz_dict | None, hata_listesi).
+    Zorunlu: coin, direction. Digerleri opsiyonel (Ayarlar varsayilanlari kullanilir)."""
+    err = []
+    if not isinstance(d, dict):
+        return None, ["payload nesne olmali"]
+
+    coin = str(d.get("coin") or d.get("symbol") or "").strip().upper()
+    coin = coin.replace("PERP", "").replace(".P", "").replace("/", "")
+    if not coin or len(coin) > 20:
+        err.append("coin gecersiz")
+
+    yon = str(d.get("direction") or d.get("side") or "").strip().upper()
+    if yon in ("SELL", "SHORT"):
+        yon = "SHORT"
+    elif yon in ("BUY", "LONG"):
+        yon = "LONG"
+    else:
+        err.append("direction SHORT/LONG (veya BUY/SELL) olmali")
+
+    clean = {"coin": coin, "direction": yon}
+
+    # opsiyonel sayisal alanlar
+    for key, (caster, lo, hi) in WH_OPT_FIELDS.items():
+        if key not in d or d.get(key) in (None, ""):
+            continue
+        v = _num(d.get(key))
+        if v is None:
+            err.append(f"{key}: sayi olmali")
+            continue
+        if v < lo or v > hi:
+            err.append(f"{key}: {lo} - {hi} arasi olmali")
+            continue
+        clean[key] = caster(v)
+
+    for key in ("tp_type", "sl_type"):
+        if key in d and d.get(key):
+            t = str(d.get(key)).strip().lower()
+            if t not in ("pct", "price"):
+                err.append(f"{key} pct veya price olmali")
+            else:
+                clean[key] = t
+
+    # tp/sl ciftleri: deger verildiyse tip de netlesmis olmali (varsayilan pct)
+    for yan in ("tp", "sl"):
+        if f"{yan}_value" in clean and f"{yan}_type" not in clean:
+            clean[f"{yan}_type"] = "pct"
+
+    if "note" in d and d.get("note"):
+        clean["note"] = str(d["note"])[:200]
+
+    if err:
+        return None, err
+    return clean, []
+
+
+# ======================================================================
 # AYAR DOGRULAMA
 # ======================================================================
 
 # alan: (tip, min, max)
 SETTING_FIELDS = {
+    "wh_margin_usdt":     (float, 1, 100000),
+    "wh_leverage":        (int,   1, 125),
+    "wh_tp_value":        (float, 0.00000001, 10000000),
+    "wh_sl_value":        (float, 0.00000001, 10000000),
+    "wh_dedup_sec":       (int,   0, 86400),
     "margin_usdt":        (float, 1, 100000),
     "leverage":           (int,   1, 125),
     "tp_pct":             (float, 0.1, 99),
@@ -412,6 +491,9 @@ SETTING_FIELDS = {
     "poll_seconds":       (int,   5, 600),
 }
 SETTING_LABELS = {
+    "wh_margin_usdt": "Webhook teminat", "wh_leverage": "Webhook kaldirac",
+    "wh_tp_value": "Webhook TP", "wh_sl_value": "Webhook SL",
+    "wh_dedup_sec": "Webhook tekrar korumasi",
     "margin_usdt": "Teminat", "leverage": "Kaldirac",
     "tp_pct": "Hard TP", "sl_pct": "Hard SL",
     "max_positions": "Max sinyal pozisyonu",
@@ -440,6 +522,14 @@ def validate_settings(d):
             continue
         clean[key] = caster(v)
 
+    for key in ("wh_tp_type", "wh_sl_type"):
+        if key in d:
+            t = (d.get(key) or "").strip().lower()
+            if t not in ("pct", "price"):
+                err.append(f"{SETTING_LABELS.get(key, key)} pct veya price olmali")
+            else:
+                clean[key] = t
+
     if "margin_mode" in d:
         mm = (d.get("margin_mode") or "").strip().lower()
         if mm not in ("cross", "isolated"):
@@ -466,8 +556,10 @@ def validate_settings(d):
         else:
             clean["signal_types"] = ",".join(types)
 
-    # dinamik cikis bloklari (sinyal havuzu icin)
-    for prefix, etiket in (("dyn_tp", "Dinamik TP"), ("dyn_sl", "Dinamik SL")):
+    # dinamik cikis bloklari (sinyal havuzu + webhook)
+    for prefix, etiket in (("dyn_tp", "Dinamik TP"), ("dyn_sl", "Dinamik SL"),
+                           ("wh_dyn_tp", "Webhook dinamik TP"),
+                           ("wh_dyn_sl", "Webhook dinamik SL")):
         if f"{prefix}_active" not in d:
             continue
         blok, derr = validate_dynamic(d, prefix, etiket)
@@ -716,6 +808,12 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
 </div>
 
 <div id="p-olaylar" style="display:none">
+  <p class="sect">Webhook kuyrugu</p>
+  <div class="card"><div class="tw"><table id="webhooks">
+    <thead><tr><th>#</th><th>Zaman</th><th>Coin</th><th>Yon</th><th>Durum</th><th>Sonuc</th></tr></thead>
+    <tbody></tbody>
+  </table></div></div>
+
   <p class="sect">Olay akisi</p>
   <div class="card"><div class="tw"><table id="events">
     <thead><tr><th>Zaman</th><th>Tip</th><th>Coin</th><th>Detay</th></tr></thead>
@@ -975,6 +1073,96 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
       </div>
   </div>
 
+  <div class="card">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:4px">
+      <p class="sect" style="margin:0">TradingView webhook</p>
+      <span id="wh-state" class="badge b-off">—</span>
+    </div>
+    <p style="font-size:11px;color:var(--text3);margin-bottom:10px">
+      Alarm payload'inda belirtilmeyen alanlar buradaki varsayilanlardan alinir.
+      Webhook pozisyonlari ozel havuza sayilir.
+    </p>
+    <div class="frow">
+      <div><label>Teminat</label><div class="cunit"><input id="s-whmargin" style="padding-left:22px"><span class="u" style="left:10px;right:auto">$</span></div></div>
+      <div><label>Kaldirac</label><div class="cunit"><input id="s-whlev"><span class="u">x</span></div></div>
+      <div><label>Tekrar korumasi</label><div class="cunit"><input id="s-whdedup"><span class="u">sn</span></div></div>
+    </div>
+    <div class="frow">
+      <div><label>TP tipi</label><select id="s-whtptype"><option value="pct">Yuzde</option><option value="price">Fiyat</option></select></div>
+      <div><label>TP degeri</label><input id="s-whtpval"></div>
+      <div><label>SL tipi</label><select id="s-whsltype"><option value="pct">Yuzde</option><option value="price">Fiyat</option></select></div>
+      <div><label>SL degeri</label><input id="s-whslval"></div>
+    </div>
+      <div class="dynbox">
+        <div class="dynhead">
+          <label class="chk"><input type="checkbox" id="wtp-active" onchange="dynToggle('wtp')"><span>Dinamik TP</span></label>
+          <span class="dynhint">Webhook pozisyonlari icin</span>
+        </div>
+        <div id="wtp-body" style="display:none">
+          <div class="frow" style="margin-top:10px">
+            <div><label>Periyot</label><select id="wtp-tf">
+              <option value="5m">5m</option><option value="15m">15m</option><option value="30m">30m</option>
+              <option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
+            </select></div>
+            <div><label>Hard ile iliski</label><select id="wtp-mode" onchange="dynModeWarn('wtp')">
+              <option value="OR">VEYA - hangisi once gelirse</option>
+              <option value="AND">VE - ikisi birden gerekli</option>
+            </select></div>
+            <div><label>Kosul mantigi</label><select id="wtp-logic">
+              <option value="-">&#8212; (tek kural)</option>
+              <option value="AND">Ve</option>
+              <option value="OR">Veya</option>
+            </select></div>
+          </div>
+          <div id="wtp-conds"></div>
+          <button class="btn" style="font-size:11px;padding:6px 12px;margin-top:6px" onclick="addCond('wtp-conds')">+ Kosul ekle</button>
+          <div id="wtp-warn" class="warnbox" style="display:none">
+            <b>VE modu uyarisi:</b> Bu modda hard seviye Binance'e emir olarak GONDERILMEZ,
+            bot her iki kosulu birlikte izler. Bot durursa bu koruma da durur.
+          </div>
+        </div>
+      </div>
+      <div class="dynbox">
+        <div class="dynhead">
+          <label class="chk"><input type="checkbox" id="wsl-active" onchange="dynToggle('wsl')"><span>Dinamik SL</span></label>
+          <span class="dynhint">Webhook pozisyonlari icin</span>
+        </div>
+        <div id="wsl-body" style="display:none">
+          <div class="frow" style="margin-top:10px">
+            <div><label>Periyot</label><select id="wsl-tf">
+              <option value="5m">5m</option><option value="15m">15m</option><option value="30m">30m</option>
+              <option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
+            </select></div>
+            <div><label>Hard ile iliski</label><select id="wsl-mode" onchange="dynModeWarn('wsl')">
+              <option value="OR">VEYA - hangisi once gelirse</option>
+              <option value="AND">VE - ikisi birden gerekli</option>
+            </select></div>
+            <div><label>Kosul mantigi</label><select id="wsl-logic">
+              <option value="-">&#8212; (tek kural)</option>
+              <option value="AND">Ve</option>
+              <option value="OR">Veya</option>
+            </select></div>
+          </div>
+          <div id="wsl-conds"></div>
+          <button class="btn" style="font-size:11px;padding:6px 12px;margin-top:6px" onclick="addCond('wsl-conds')">+ Kosul ekle</button>
+          <div id="wsl-warn" class="warnbox" style="display:none">
+            <b>VE modu uyarisi:</b> Bu modda hard seviye Binance'e emir olarak GONDERILMEZ,
+            bot her iki kosulu birlikte izler. Bot durursa bu koruma da durur.
+          </div>
+        </div>
+      </div>
+    <div style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px">
+      <label>Pine Script alarm mesaji</label>
+      <textarea id="wh-sample" rows="3" readonly
+        style="width:100%;font-family:'JetBrains Mono',monospace;font-size:11px;
+        line-height:1.5;resize:vertical;margin-top:4px"></textarea>
+      <p style="font-size:11px;color:var(--text3);margin-top:6px">
+        TradingView alarm penceresinde "Webhook URL" alanina panel adresini + <b>/webhook</b> yaz,
+        mesaj kutusuna yukaridaki JSON'u koy. Token sunucu env'inde (WEBHOOK_TOKEN) tanimli olmali.
+      </p>
+    </div>
+  </div>
+
   <div id="s-errors" class="errbox"></div>
 
   <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin:12px 0 4px;flex-wrap:wrap">
@@ -1143,6 +1331,22 @@ function render(){
       +'<td class="mut mono">'+esc((t.opened_at||'').replace('T',' ').slice(5,16))+'</td></tr>';
   }).join(''):'<tr><td colspan="8" class="empty">Islem yok</td></tr>';
 
+  var wb=document.querySelector('#webhooks tbody');
+  var whs=state.webhooks||[];
+  wb.innerHTML=whs.length?whs.map(function(w){
+    var d;
+    if(!w.executed){d='<span class="badge b-test">Bekliyor</span>';}
+    else if((w.result||'').indexOf('OPENED')===0){d='<span class="badge b-ok">Acildi</span>';}
+    else if((w.result||'').indexOf('SKIPPED')===0){d='<span class="badge b-sig">Atlandi</span>';}
+    else {d='<span class="badge b-off">Hata</span>';}
+    return '<tr><td class="mut">'+w.id+'</td>'
+      +'<td class="mut mono">'+esc((w.created_at||'').replace('T',' ').slice(5,19))+'</td>'
+      +'<td><b>'+esc(w.coin)+'</b></td>'
+      +'<td><span class="badge '+(w.direction==='LONG'?'b-long':'b-short')+'">'+esc(w.direction)+'</span></td>'
+      +'<td>'+d+'</td>'
+      +'<td style="white-space:normal">'+esc(w.result||'—')+'</td></tr>';
+  }).join(''):'<tr><td colspan="6" class="empty">Webhook yok</td></tr>';
+
   var eb=document.querySelector('#events tbody');
   var evs=state.events||[];
   eb.innerHTML=evs.length?evs.map(function(e){
@@ -1179,7 +1383,10 @@ var settingsDirty=false;
 var S_MAP={'s-margin':'margin_usdt','s-lev':'leverage','s-mm':'margin_mode',
   's-tp':'tp_pct','s-sl':'sl_pct','s-dedup':'dedup_days','s-types':'signal_types',
   's-strength':'strength','s-maxpos':'max_positions','s-maxrule':'max_rule_positions',
-  's-minbal':'min_balance','s-minfree':'rule_min_free','s-poll':'poll_seconds'};
+  's-minbal':'min_balance','s-minfree':'rule_min_free','s-poll':'poll_seconds',
+  's-whmargin':'wh_margin_usdt','s-whlev':'wh_leverage','s-whdedup':'wh_dedup_sec',
+  's-whtptype':'wh_tp_type','s-whtpval':'wh_tp_value',
+  's-whsltype':'wh_sl_type','s-whslval':'wh_sl_value'};
 
 function fillSettings(){
   var st=state&&state.settings;
@@ -1194,12 +1401,22 @@ function fillSettings(){
     mode:st.dyn_tp_mode,logic:st.dyn_tp_logic,conditions:st.dyn_tp_conditions});
   dynFill('ssl',{active:st.dyn_sl_active,timeframe:st.dyn_sl_timeframe,
     mode:st.dyn_sl_mode,logic:st.dyn_sl_logic,conditions:st.dyn_sl_conditions});
+  dynFill('wtp',{active:st.wh_dyn_tp_active,timeframe:st.wh_dyn_tp_timeframe,
+    mode:st.wh_dyn_tp_mode,logic:st.wh_dyn_tp_logic,conditions:st.wh_dyn_tp_conditions});
+  dynFill('wsl',{active:st.wh_dyn_sl_active,timeframe:st.wh_dyn_sl_timeframe,
+    mode:st.wh_dyn_sl_mode,logic:st.wh_dyn_sl_logic,conditions:st.wh_dyn_sl_conditions});
+  var ws=document.getElementById('wh-state');
+  if(state.webhook_enabled){ws.textContent='Aktif';ws.className='badge b-ok';}
+  else{ws.textContent='Kapali - WEBHOOK_TOKEN yok';ws.className='badge b-off';}
+  document.getElementById('wh-sample').value=
+    '{"token":"<WEBHOOK_TOKEN>","coin":"{{ticker}}","direction":"SHORT"}';
   settingsDirty=false;
   document.getElementById('s-errors').style.display='none';
 }
 
 function saveSettings(){
-  var body=Object.assign({}, dynRead('stp','dyn_tp'), dynRead('ssl','dyn_sl'));
+  var body=Object.assign({}, dynRead('stp','dyn_tp'), dynRead('ssl','dyn_sl'),
+    dynRead('wtp','wh_dyn_tp'), dynRead('wsl','wh_dyn_sl'));
   Object.keys(S_MAP).forEach(function(id){
     var el=document.getElementById(id);
     if(el) body[S_MAP[id]]=el.value;
@@ -1360,7 +1577,8 @@ function fillRow(row,c,useDefaults){
 function onTypeChange(sel){ fillRow(sel.parentNode,null,true); }
 /* kosul kutulari: giris ('conds'), dinamik TP ('dtp-conds'), dinamik SL ('dsl-conds') */
 var LOGIC_OF={'conds':'f-logic','dtp-conds':'dtp-logic','dsl-conds':'dsl-logic',
-  'stp-conds':'stp-logic','ssl-conds':'ssl-logic'};
+  'stp-conds':'stp-logic','ssl-conds':'ssl-logic',
+  'wtp-conds':'wtp-logic','wsl-conds':'wsl-logic'};
 
 function addCond(boxId,c){
   boxId=boxId||'conds';
@@ -1579,7 +1797,7 @@ Object.keys(S_MAP).forEach(function(id){
   var el=document.getElementById(id);
   if(el)el.addEventListener('input',function(){settingsDirty=true;});
 });
-['stp','ssl'].forEach(function(on){
+['stp','ssl','wtp','wsl'].forEach(function(on){
   ['-active','-tf','-mode','-logic'].forEach(function(sfx){
     var el=document.getElementById(on+sfx);
     if(el)el.addEventListener('change',function(){settingsDirty=true;});
@@ -1663,7 +1881,62 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return None
 
+    def _webhook(self):
+        """TradingView webhook ucu. Basic Auth MUAF (TV sifre gonderemez),
+        token ile korunur. Kuyruga yazar; emri executor acar."""
+        d = self._body()
+        gelen_token = ""
+        if isinstance(d, dict):
+            gelen_token = str(d.get("token") or "")
+        if not gelen_token:
+            gelen_token = self.headers.get("X-Webhook-Token", "") or ""
+
+        if not WEBHOOK_TOKEN:
+            log("Webhook geldi ama WEBHOOK_TOKEN tanimli degil - reddedildi", "WARN")
+            sb_post("sts_events", {"kind": "WEBHOOK_REJECT", "coin": None,
+                                   "detail": "WEBHOOK_TOKEN tanimli degil"})
+            self._send(503, json.dumps({"ok": False, "error": "webhook kapali"}))
+            return
+
+        if gelen_token != WEBHOOK_TOKEN:
+            kaynak = self.headers.get("X-Forwarded-For") or self.client_address[0]
+            log(f"Webhook token HATALI (kaynak {kaynak}) - reddedildi", "WARN")
+            sb_post("sts_events", {"kind": "WEBHOOK_REJECT", "coin": None,
+                                   "detail": f"hatali token, kaynak {kaynak}"})
+            self._send(401, json.dumps({"ok": False, "error": "token"}))
+            return
+
+        if d is None:
+            self._send(400, json.dumps({"ok": False, "errors": ["payload okunamadi"]}))
+            return
+
+        clean, errs = validate_webhook(d)
+        if errs:
+            log(f"Webhook gecersiz: {errs}", "WARN")
+            sb_post("sts_events", {"kind": "WEBHOOK_REJECT",
+                                   "coin": str(d.get("coin") or "")[:20] or None,
+                                   "detail": "; ".join(errs)[:400]})
+            self._send(400, json.dumps({"ok": False, "errors": errs}))
+            return
+
+        govde = {k: v for k, v in clean.items() if k not in ("coin", "direction")}
+        res = sb_post("sts_webhooks", {
+            "coin": clean["coin"], "direction": clean["direction"],
+            "payload": govde or None,
+        })
+        if res is None:
+            self._send(500, json.dumps({"ok": False, "error": "kuyruga yazilamadi"}))
+            return
+        wid = res[0].get("id") if res else None
+        log(f"Webhook alindi: {clean['coin']} {clean['direction']} (kuyruk #{wid})")
+        self._send(200, json.dumps({"ok": True, "id": wid,
+                                    "coin": clean["coin"], "direction": clean["direction"]}))
+
     def do_POST(self):
+        # webhook auth'tan MUAF - token kendi icinde
+        if self.path == "/webhook":
+            self._webhook()
+            return
         if not self._authed():
             return
         if self.path == "/api/stop":
@@ -1808,7 +2081,9 @@ def main():
         sys.stderr.write("HATA: SUPABASE_URL / SUPABASE_KEY tanimli degil.\n")
         sys.exit(1)
     srv = ThreadingHTTPServer((PANEL_BIND, PANEL_PORT), Handler)
-    log(f"STS PANEL {VERSION} dinliyor: http://{PANEL_BIND}:{PANEL_PORT} | auth={'acik' if AUTH_ON else 'KAPALI'}")
+    log(f"STS PANEL {VERSION} dinliyor: http://{PANEL_BIND}:{PANEL_PORT} | "
+        f"auth={'acik' if AUTH_ON else 'KAPALI'} | "
+        f"webhook={'acik' if WEBHOOK_TOKEN else 'KAPALI (WEBHOOK_TOKEN yok)'}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
