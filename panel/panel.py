@@ -241,6 +241,12 @@ def validate_rule(d):
         if t == "rsi" and not (0 <= p2 <= 100):
             err.append(f"kosul {i}: rsi esigi 0-100 arasi olmali")
             continue
+        # oi_change / volume: yon operatorde, deger her zaman pozitif saklanir
+        if t in ("oi_change", "volume"):
+            p2 = abs(p2)
+            if p2 == 0:
+                err.append(f"kosul {i}: yuzde degeri 0 olamaz")
+                continue
         conds.append({"type": t, "op": op,
                       "p1": p1 if t in NEEDS_P1 else None, "p2": p2})
 
@@ -305,6 +311,9 @@ def gather_state():
     ctrl = sb_get("sts_control?id=eq.1&limit=1")
     killswitch = bool(ctrl[0].get("killswitch")) if ctrl else False
 
+    stg = sb_get("sts_settings?id=eq.1&limit=1")
+    settings = stg[0] if stg else None
+
     trades = sb_get("bot_trades?order=id.desc&limit=100") or []
     events = sb_get("sts_events?order=id.desc&limit=100") or []
     rules  = sb_get("sts_rules?order=id.desc&limit=50") or []
@@ -313,11 +322,96 @@ def gather_state():
         "status": status,
         "status_age": round(status_age) if status_age is not None else None,
         "killswitch": killswitch,
+        "settings": settings,
         "trades": trades,
         "events": events,
         "rules": rules,
         "server_time": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ======================================================================
+# AYAR DOGRULAMA
+# ======================================================================
+
+# alan: (tip, min, max)
+SETTING_FIELDS = {
+    "margin_usdt":        (float, 1, 100000),
+    "leverage":           (int,   1, 125),
+    "tp_pct":             (float, 0.1, 99),
+    "sl_pct":             (float, 0.1, 500),
+    "max_positions":      (int,   1, 50),
+    "max_rule_positions": (int,   1, 50),
+    "min_balance":        (float, 0, 1000000),
+    "rule_min_free":      (float, 0, 1000000),
+    "dedup_days":         (float, 0, 365),
+    "poll_seconds":       (int,   5, 600),
+}
+SETTING_LABELS = {
+    "margin_usdt": "Teminat", "leverage": "Kaldirac",
+    "tp_pct": "Hard TP", "sl_pct": "Hard SL",
+    "max_positions": "Max sinyal pozisyonu",
+    "max_rule_positions": "Max kural pozisyonu",
+    "min_balance": "Min bakiye", "rule_min_free": "Kural min serbest bakiye",
+    "dedup_days": "Dedup suresi", "poll_seconds": "Tarama araligi",
+}
+
+
+def validate_settings(d):
+    """Panelden gelen ayarlari dogrula. Doner: (temiz_dict | None, hata_listesi).
+    NOT: testnet burada YOK - env'de kalir (guvenlik)."""
+    err = []
+    clean = {}
+
+    for key, (caster, lo, hi) in SETTING_FIELDS.items():
+        if key not in d:
+            continue
+        v = _num(d.get(key))
+        ad = SETTING_LABELS.get(key, key)
+        if v is None:
+            err.append(f"{ad}: sayi olmali")
+            continue
+        if v < lo or v > hi:
+            err.append(f"{ad}: {lo} - {hi} arasi olmali")
+            continue
+        clean[key] = caster(v)
+
+    if "margin_mode" in d:
+        mm = (d.get("margin_mode") or "").strip().lower()
+        if mm not in ("cross", "isolated"):
+            err.append("Marj modu cross veya isolated olmali")
+        else:
+            clean["margin_mode"] = mm
+
+    if "strength" in d:
+        st = (d.get("strength") or "").strip()
+        if not st or len(st) > 30:
+            err.append("Strength degeri gecersiz")
+        else:
+            clean["strength"] = st
+
+    if "signal_types" in d:
+        raw = d.get("signal_types") or ""
+        types = [s.strip().upper() for s in str(raw).split(",") if s.strip()]
+        if not types:
+            err.append("En az bir sinyal tipi gerekli")
+        elif len(types) > 10:
+            err.append("En fazla 10 sinyal tipi")
+        elif any(len(t) > 30 for t in types):
+            err.append("Sinyal tipi cok uzun")
+        else:
+            clean["signal_types"] = ",".join(types)
+
+    # tutarlilik: TP/SL mantigi
+    if clean.get("tp_pct") is not None and clean["tp_pct"] >= 100:
+        err.append("Hard TP %100'den kucuk olmali")
+
+    if not clean and not err:
+        err.append("Degistirilecek alan yok")
+
+    if err:
+        return None, err
+    return clean, []
 
 
 # ======================================================================
@@ -511,6 +605,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
   <button class="tab" onclick="show('islemler',this)">Islemler</button>
   <button class="tab" onclick="show('olaylar',this)">Olaylar</button>
   <button class="tab" onclick="show('kurallar',this)">Kurallar</button>
+  <button class="tab" onclick="show('ayarlar',this)">Ayarlar</button>
 </div>
 
 <div id="p-durum">
@@ -575,7 +670,10 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
           </div>
         </div>
         <div id="conds"></div>
-        <button class="btn" style="font-size:11px;padding:6px 12px;margin-top:6px" onclick="addCond()">+ Kosul ekle</button>
+        <div style="display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap">
+          <button class="btn" style="font-size:11px;padding:6px 12px" onclick="addCond()">+ Kosul ekle</button>
+          <span style="font-size:11px;color:var(--text3)">OI ve Hacim: son bar, onceki N barin ortalamasina gore karsilastirilir. Yonu operator belirler, eksi isareti gerekmez.</span>
+        </div>
       </div>
 
       <div class="divider frow">
@@ -601,11 +699,79 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
     </div>
   </div>
 
+  <div class="card">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+      <p class="sect" style="margin:0">JSON ile kural ekle</p>
+      <button class="btn" onclick="toggleJson()" id="json-toggle">Ac</button>
+    </div>
+    <div id="json-box" style="display:none">
+      <p style="font-size:11px;color:var(--text3);margin-bottom:8px">
+        Tek kural veya kural listesi yapistirabilirsin. Form ile ayni dogrulamadan gecer.
+      </p>
+      <textarea id="f-json" rows="9" placeholder='{"coin":"HEI","direction":"SHORT","timeframe":"5m","conditions":[{"type":"ema_cross","op":"<","p1":7,"p2":30}],"tp_type":"price","tp_value":0.189,"sl_type":"price","sl_value":0.235,"margin_usdt":100,"leverage":10,"expire_days":3}'
+        style="width:100%;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.5;resize:vertical"></textarea>
+      <div id="json-errors" class="errbox"></div>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:10px;flex-wrap:wrap">
+        <button class="btn" style="font-size:11px;padding:6px 12px" onclick="ornekJson()">Ornek doldur</button>
+        <div style="display:flex;gap:8px">
+          <button class="btn" onclick="document.getElementById('f-json').value=''">Temizle</button>
+          <button class="btn btn-go" onclick="importJson()" id="json-save">Ekle</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <p class="sect">Kayitli kurallar</p>
   <div class="card"><div class="tw"><table id="rules">
     <thead><tr><th>#</th><th>Coin</th><th>Yon</th><th>Periyot</th><th>Kosullar</th><th>TP</th><th>SL</th><th>Teminat</th><th>Durum</th><th></th></tr></thead>
     <tbody></tbody>
   </table></div></div>
+</div>
+
+<div id="p-ayarlar" style="display:none">
+  <div class="card">
+    <p class="sect">Sinyal havuzu stratejisi</p>
+    <div class="frow">
+      <div><label>Teminat</label><div class="cunit"><input id="s-margin" style="padding-left:22px"><span class="u" style="left:10px;right:auto">$</span></div></div>
+      <div><label>Kaldirac</label><div class="cunit"><input id="s-lev"><span class="u">x</span></div></div>
+      <div><label>Marj modu</label><select id="s-mm"><option value="cross">Cross</option><option value="isolated">Isolated</option></select></div>
+    </div>
+    <div class="frow">
+      <div><label>Hard TP</label><div class="cunit"><input id="s-tp"><span class="u">%</span></div></div>
+      <div><label>Hard SL</label><div class="cunit"><input id="s-sl"><span class="u">%</span></div></div>
+      <div><label>Dedup suresi</label><div class="cunit"><input id="s-dedup"><span class="u">gun</span></div></div>
+    </div>
+    <div class="frow">
+      <div><label>Sinyal tipleri</label><input id="s-types" placeholder="PUMP_1H,PUMP_15M"></div>
+      <div><label>Strength</label><input id="s-strength" placeholder="strong"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <p class="sect">Havuz limitleri ve kasa</p>
+    <div class="frow">
+      <div><label>Max sinyal pozisyonu</label><input id="s-maxpos"></div>
+      <div><label>Max kural pozisyonu</label><input id="s-maxrule"></div>
+    </div>
+    <div class="frow">
+      <div><label>Min bakiye (sinyal)</label><div class="cunit"><input id="s-minbal" style="padding-left:22px"><span class="u" style="left:10px;right:auto">$</span></div></div>
+      <div><label>Kural min serbest bakiye</label><div class="cunit"><input id="s-minfree" style="padding-left:22px"><span class="u" style="left:10px;right:auto">$</span></div></div>
+      <div><label>Tarama araligi</label><div class="cunit"><input id="s-poll"><span class="u">sn</span></div></div>
+    </div>
+  </div>
+
+  <div id="s-errors" class="errbox"></div>
+
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin:12px 0 4px;flex-wrap:wrap">
+    <span style="font-size:11px;color:var(--text3)">
+      Testnet / canli anahtari guvenlik nedeniyle panelde degil, Coolify env ayarindadir.
+      Kaydedilen ayarlar executor tarafindan en fazla 30 saniye icinde uygulanir.
+    </span>
+    <div style="display:flex;gap:8px">
+      <button class="btn" onclick="fillSettings()">Geri al</button>
+      <button class="btn btn-go" onclick="saveSettings()" id="s-save">Kaydet</button>
+    </div>
+  </div>
 </div>
 
 <div id="toast"></div>
@@ -634,7 +800,7 @@ function toggleTheme(){
 
 /* ---------- yardimcilar ---------- */
 function show(name, el){
-  ['durum','islemler','olaylar','kurallar'].forEach(function(n){
+  ['durum','islemler','olaylar','kurallar','ayarlar'].forEach(function(n){
     document.getElementById('p-'+n).style.display=(n===name)?'':'none';
   });
   document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('on')});
@@ -789,6 +955,101 @@ function render(){
       +'<button class="mini del" onclick="delRule('+r.id+')">Sil</button>'
       +'</td></tr>';
   }).join(''):'<tr><td colspan="10" class="empty">Kural yok</td></tr>';
+
+  if(!settingsDirty) fillSettings();
+}
+
+/* ---------- ayarlar ---------- */
+var settingsDirty=false;
+var S_MAP={'s-margin':'margin_usdt','s-lev':'leverage','s-mm':'margin_mode',
+  's-tp':'tp_pct','s-sl':'sl_pct','s-dedup':'dedup_days','s-types':'signal_types',
+  's-strength':'strength','s-maxpos':'max_positions','s-maxrule':'max_rule_positions',
+  's-minbal':'min_balance','s-minfree':'rule_min_free','s-poll':'poll_seconds'};
+
+function fillSettings(){
+  var st=state&&state.settings;
+  if(!st)return;
+  Object.keys(S_MAP).forEach(function(id){
+    var el=document.getElementById(id);
+    if(!el)return;
+    var v=st[S_MAP[id]];
+    el.value=(v===null||v===undefined)?'':v;
+  });
+  settingsDirty=false;
+  document.getElementById('s-errors').style.display='none';
+}
+
+function saveSettings(){
+  var body={};
+  Object.keys(S_MAP).forEach(function(id){
+    var el=document.getElementById(id);
+    if(el) body[S_MAP[id]]=el.value;
+  });
+  var btn=document.getElementById('s-save');
+  btn.disabled=true;btn.textContent='Kaydediliyor...';
+  fetch('/api/settings',{method:'PATCH',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(body)})
+    .then(function(r){return r.json().then(function(j){return {s:r.status,j:j}})})
+    .then(function(res){
+      btn.disabled=false;btn.textContent='Kaydet';
+      if(res.s===200&&res.j.ok){
+        settingsDirty=false;
+        document.getElementById('s-errors').style.display='none';
+        toast('Ayarlar kaydedildi');refresh();
+      }else{
+        var b=document.getElementById('s-errors');
+        b.innerHTML=(res.j.errors||['Kaydedilemedi']).map(function(e){return '&bull; '+esc(e)}).join('<br>');
+        b.style.display='';
+      }
+    }).catch(function(){
+      btn.disabled=false;btn.textContent='Kaydet';
+      var b=document.getElementById('s-errors');
+      b.innerHTML='&bull; Baglanti hatasi';b.style.display='';
+    });
+}
+
+/* ---------- JSON ile kural ekleme ---------- */
+function toggleJson(){
+  var b=document.getElementById('json-box'), t=document.getElementById('json-toggle');
+  var acik=b.style.display!=='none';
+  b.style.display=acik?'none':'';
+  t.textContent=acik?'Ac':'Kapat';
+}
+function ornekJson(){
+  document.getElementById('f-json').value=JSON.stringify({
+    coin:'HEI', direction:'SHORT', timeframe:'5m', logic:'-',
+    conditions:[{type:'ema_cross',op:'<',p1:7,p2:30}],
+    tp_type:'price', tp_value:0.189, sl_type:'price', sl_value:0.235,
+    margin_usdt:100, leverage:10, expire_days:3, note:'ornek'
+  },null,2);
+}
+function importJson(){
+  var raw=document.getElementById('f-json').value.trim();
+  var box=document.getElementById('json-errors');
+  box.style.display='none';
+  if(!raw){box.innerHTML='&bull; JSON bos';box.style.display='';return;}
+  var data;
+  try{ data=JSON.parse(raw); }
+  catch(e){ box.innerHTML='&bull; JSON gecersiz: '+esc(e.message);box.style.display='';return; }
+  var btn=document.getElementById('json-save');
+  btn.disabled=true;btn.textContent='Ekleniyor...';
+  fetch('/api/rules/import',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(data)})
+    .then(function(r){return r.json().then(function(j){return {s:r.status,j:j}})})
+    .then(function(res){
+      btn.disabled=false;btn.textContent='Ekle';
+      if(res.s===200&&res.j.ok){
+        toast(res.j.count+' kural eklendi');
+        document.getElementById('f-json').value='';
+        toggleJson();refresh();
+      }else{
+        box.innerHTML=(res.j.errors||['Eklenemedi']).map(function(e){return '&bull; '+esc(e)}).join('<br>');
+        box.style.display='';
+      }
+    }).catch(function(){
+      btn.disabled=false;btn.textContent='Ekle';
+      box.innerHTML='&bull; Baglanti hatasi';box.style.display='';
+    });
 }
 
 /* ---------- kosul tanimlari ---------- */
@@ -796,10 +1057,12 @@ var CT={
   ema_cross:{ad:'EMA kesisimi', p1:'Hizli', p2:'Yavas',  u2:'',  d1:7,   d2:30,    op:'<'},
   rsi:      {ad:'RSI',          p1:null,    p2:'Esik',   u2:'',  d1:null,d2:70,    op:'>'},
   price:    {ad:'Fiyat',        p1:null,    p2:'Fiyat',  u2:'$', d1:null,d2:'',    op:'<'},
-  oi_change:{ad:'OI degisimi',  p1:'Bar',   p2:'Degisim',u2:'%', d1:3,   d2:5,     op:'>'},
-  volume:   {ad:'Hacim',        p1:'Bar',   p2:'Degisim',u2:'%', d1:3,   d2:5,     op:'>'},
+  oi_change:{ad:'OI degisimi',  p1:'Onceki bar', p2:'Fark', u2:'%', d1:3, d2:5,   op:'>'},
+  volume:   {ad:'Hacim',        p1:'Onceki bar', p2:'Fark', u2:'%', d1:3, d2:5,   op:'>'},
   funding:  {ad:'Funding',      p1:null,    p2:'Oran',   u2:'%', d1:null,d2:-0.05, op:'<'}
 };
+
+function yonTxt(op){ return (op==='>'||op==='>=') ? 'uzeri' : 'alti'; }
 
 function condText(conds,logic){
   if(typeof conds==='string'){try{conds=JSON.parse(conds)}catch(e){return String(conds)}}
@@ -808,8 +1071,8 @@ function condText(conds,logic){
     var t=c.type;
     if(t==='ema_cross')return 'EMA'+c.p1+' '+c.op+' EMA'+c.p2;
     if(t==='rsi')return 'RSI '+c.op+' '+c.p2;
-    if(t==='oi_change')return 'OI('+c.p1+'bar ort) '+c.op+' '+c.p2+'%';
-    if(t==='volume')return 'Hacim('+c.p1+'bar ort) '+c.op+' '+c.p2+'%';
+    if(t==='oi_change')return 'OI: '+c.p1+' bar ort. '+yonTxt(c.op)+' %'+Math.abs(c.p2);
+    if(t==='volume')return 'Hacim: '+c.p1+' bar ort. '+yonTxt(c.op)+' %'+Math.abs(c.p2);
     if(t==='funding')return 'Funding '+c.op+' '+c.p2+'%';
     if(t==='price')return 'Fiyat '+c.op+' $'+c.p2;
     return t+' '+c.op+' '+c.p2;
@@ -1021,6 +1284,11 @@ function refresh(){
     h.textContent='Panel hatasi';h.className='badge b-off';
   });
 }
+Object.keys(S_MAP).forEach(function(id){
+  var el=document.getElementById(id);
+  if(el)el.addEventListener('input',function(){settingsDirty=true;});
+});
+
 refresh();
 setInterval(refresh,10000);
 </script>
@@ -1107,6 +1375,40 @@ class Handler(BaseHTTPRequestHandler):
             ok = set_killswitch(False)
             log("Kill-switch KALDIRILDI (panel)")
             self._send(200 if ok else 500, json.dumps({"ok": ok, "killswitch": False}))
+        elif self.path == "/api/rules/import":
+            # JSON yapistirma: tek kural veya kural listesi
+            d = self._body()
+            if d is None:
+                self._send(400, json.dumps({"ok": False, "errors": ["JSON okunamadi"]}))
+                return
+            items = d if isinstance(d, list) else [d]
+            if not items:
+                self._send(400, json.dumps({"ok": False, "errors": ["Bos JSON"]}))
+                return
+            if len(items) > 20:
+                self._send(400, json.dumps({"ok": False, "errors": ["En fazla 20 kural"]}))
+                return
+            temiz, hatalar = [], []
+            for i, it in enumerate(items, 1):
+                if not isinstance(it, dict):
+                    hatalar.append(f"{i}. kayit nesne degil")
+                    continue
+                c, e = validate_rule(it)
+                if e:
+                    on = f"{i}. kural: " if len(items) > 1 else ""
+                    hatalar += [on + x for x in e]
+                else:
+                    temiz.append(c)
+            if hatalar:
+                self._send(400, json.dumps({"ok": False, "errors": hatalar}))
+                return
+            res = sb_post("sts_rules", temiz)
+            if res is None:
+                self._send(500, json.dumps({"ok": False, "errors": ["kayit basarisiz"]}))
+                return
+            log(f"JSON ile {len(temiz)} kural eklendi")
+            self._send(200, json.dumps({"ok": True, "count": len(temiz)}))
+            return
         elif self.path == "/api/rules":
             d = self._body()
             if d is None:
@@ -1127,6 +1429,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PATCH(self):
         if not self._authed():
+            return
+        # /api/settings -> strateji ayarlari
+        if self.path == "/api/settings":
+            d = self._body()
+            if d is None:
+                self._send(400, json.dumps({"ok": False, "errors": ["gecersiz istek"]}))
+                return
+            clean, errs = validate_settings(d)
+            if errs:
+                self._send(400, json.dumps({"ok": False, "errors": errs}))
+                return
+            clean["updated_at"] = datetime.now(timezone.utc).isoformat()
+            ok = sb_patch("sts_settings?id=eq.1", clean)
+            if ok:
+                log("Ayarlar guncellendi: " + ", ".join(f"{k}={v}" for k, v in clean.items()
+                                                        if k != "updated_at"))
+            self._send(200 if ok else 500, json.dumps({"ok": ok}))
             return
         # /api/rules/{id}/toggle  -> aktif/pasif
         if self.path.startswith("/api/rules/") and self.path.endswith("/toggle"):
