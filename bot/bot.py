@@ -120,6 +120,19 @@ CFG = {
     "poll_seconds":       _env_i("BOT_POLL_SECONDS", 20),
 }
 SETTINGS_POLL_SEC = _env_i("BOT_SETTINGS_POLL_SEC", 30)
+WEBHOOK_POLL_SEC  = _env_i("BOT_WEBHOOK_POLL_SEC", 5)   # kuyruk kontrol araligi
+
+# Webhook varsayilanlari (payload'da belirtilmeyen alanlar icin).
+# sts_settings'ten wh_* kolonlariyla ustune yazilir.
+WH = {
+    "margin_usdt": _env_f("BOT_WH_MARGIN_USDT", 100),
+    "leverage":    _env_i("BOT_WH_LEVERAGE", 10),
+    "tp_type":     _env("BOT_WH_TP_TYPE", "pct"),
+    "tp_value":    _env_f("BOT_WH_TP_VALUE", 10),
+    "sl_type":     _env("BOT_WH_SL_TYPE", "pct"),
+    "sl_value":    _env_f("BOT_WH_SL_VALUE", 15),
+    "dedup_sec":   _env_i("BOT_WH_DEDUP_SEC", 60),
+}
 
 # --- Ozel kural havuzu (panelden degistirilmeyen sabitler) ---
 RULE_LIMIT      = _env_i("BOT_RULE_LIMIT", 50)          # aktif kural ust siniri
@@ -277,6 +290,33 @@ def sb_close_trade(trade_id, exit_price, pnl, reason):
 
 # --- kural havuzu ---
 
+def sb_pending_webhooks():
+    rows = sb_request("GET", "sts_webhooks?executed=is.false&order=id.asc&limit=10")
+    return rows if rows else []
+
+
+def sb_mark_webhook(wid, result, trade_id=None):
+    body = {"executed": True,
+            "executed_at": datetime.now(timezone.utc).isoformat(),
+            "result": str(result)[:200]}
+    if trade_id:
+        body["trade_id"] = trade_id
+    return sb_request("PATCH", f"sts_webhooks?id=eq.{wid}", body)
+
+
+def sb_recent_webhook_coins(seconds):
+    """Son N saniyede ISLENMIS webhook coinleri (tekrar korumasi)."""
+    if seconds <= 0:
+        return set()
+    since = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+    rows = sb_request(
+        "GET", f"sts_webhooks?select=coin&executed=is.true&executed_at=gte.{since}"
+               f"&result=like.OPENED*")
+    if not rows:
+        return set()
+    return {r.get("coin") for r in rows if r.get("coin")}
+
+
 def sb_active_rules():
     rows = sb_request("GET", f"sts_rules?active=is.true&order=id.asc&limit={RULE_LIMIT}")
     return rows if rows else []
@@ -340,6 +380,30 @@ def apply_settings(row):
     if st and CFG["strength"] != st:
         CFG["strength"] = st
         changed.append("strength")
+
+    # webhook varsayilanlari
+    for key, caster in (("margin_usdt", float), ("leverage", int),
+                        ("tp_value", float), ("sl_value", float),
+                        ("dedup_sec", int)):
+        val = row.get("wh_" + key)
+        if val is None:
+            continue
+        try:
+            v = caster(val)
+        except (TypeError, ValueError):
+            continue
+        if v <= 0 and key != "dedup_sec":
+            continue
+        if v < 0:
+            continue
+        if WH.get(key) != v:
+            WH[key] = v
+            changed.append("wh_" + key)
+    for key in ("tp_type", "sl_type"):
+        t = (row.get("wh_" + key) or "").strip().lower()
+        if t in ("pct", "price") and WH[key] != t:
+            WH[key] = t
+            changed.append("wh_" + key)
 
     raw = row.get("signal_types") or ""
     types = [s.strip().upper() for s in str(raw).split(",") if s.strip()]
@@ -807,6 +871,7 @@ class Bot:
         self.settings_loaded_at = 0
         self.settings_warned = False
         self.settings_row = None     # sinyal havuzu dinamik cikis yapilandirmasi
+        self.webhook_checked_at = 0
         self.rule_last_bar = {}      # rule_id -> son degerlendirilen bar id
         self.dyn_last_bar = {}       # (trade_id, dyn_tp|dyn_sl) -> son bar id
         self.kline_cache = {}        # (sym, tf) -> (bar_id, ohlcv)
@@ -919,6 +984,7 @@ class Bot:
                 else:
                     self.process_signals()
                     self.process_rules()
+                    self.process_webhooks()
             except Exception as e:
                 log(f"Dongu hatasi: {e}", "ERROR")
                 sb_log_event("ERROR", None, f"dongu: {e}")
@@ -1427,6 +1493,116 @@ class Bot:
         return entry * (1 + pct) if is_tp else entry * (1 - pct)
 
     # ------------------------------------------------------------------
+    # HAVUZ 2b - TRADINGVIEW WEBHOOK
+    # ------------------------------------------------------------------
+    def process_webhooks(self):
+        """Kuyruktaki webhook sinyallerini isle. Ozel havuza sayilir."""
+        nowt = time.time()
+        if nowt - self.webhook_checked_at < WEBHOOK_POLL_SEC:
+            return
+        self.webhook_checked_at = nowt
+
+        bekleyen = sb_pending_webhooks()
+        if not bekleyen:
+            return
+
+        for wh in bekleyen:
+            wid = wh.get("id")
+            coin = (wh.get("coin") or "").strip().upper()
+            yon = (wh.get("direction") or "SHORT").strip().upper()
+            payload = wh.get("payload") or {}
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+            try:
+                sonuc = self.handle_webhook(wid, coin, yon, payload)
+            except Exception as e:
+                log(f"Webhook #{wid} ({coin}) hata: {e}", "ERROR")
+                sb_log_event("ERROR", coin, f"webhook #{wid}: {e}")
+                sonuc = f"ERROR:{e}"
+            sb_mark_webhook(wid, sonuc)
+
+    def handle_webhook(self, wid, coin, yon, payload):
+        """Tek webhook sinyalini degerlendir. Doner: sonuc metni."""
+        log(f"Webhook #{wid}: {coin} {yon}")
+
+        if yon not in ("SHORT", "LONG"):
+            return "SKIPPED:gecersiz yon"
+
+        symbol = self.ex.unified(coin)
+        if not symbol:
+            sb_log_event("SIGNAL_SKIP", coin, f"webhook #{wid}: coin binance futures'ta yok")
+            return "SKIPPED:coin yok"
+
+        if self.stopped():
+            sb_log_event("SIGNAL_SKIP", coin, f"webhook #{wid}: kill-switch aktif")
+            return "SKIPPED:kill-switch"
+
+        live = self.ex.open_positions()
+        if live is None:
+            return "SKIPPED:pozisyonlar okunamadi"
+        if symbol in live or symbol in self.open_trades:
+            sb_log_event("SIGNAL_SKIP", coin, f"webhook #{wid}: coinde acik pozisyon var")
+            return "SKIPPED:coinde acik pozisyon"
+
+        _, rule_count = self.count_pools(live)
+        if rule_count >= CFG["max_rule_positions"]:
+            sb_log_event("SIGNAL_SKIP", coin,
+                         f"webhook #{wid}: ozel havuz dolu ({rule_count}/{CFG['max_rule_positions']})")
+            tg_send(f"<b>WEBHOOK ATLANDI</b> {coin}\nOzel havuz dolu "
+                    f"({rule_count}/{CFG['max_rule_positions']})")
+            return "SKIPPED:havuz dolu"
+
+        # kisa sureli tekrar korumasi
+        dedup = int(WH.get("dedup_sec") or 0)
+        if dedup > 0 and coin in sb_recent_webhook_coins(dedup):
+            sb_log_event("SIGNAL_SKIP", coin, f"webhook #{wid}: son {dedup} sn icinde islendi")
+            return f"SKIPPED:tekrar ({dedup}sn)"
+
+        # parametreler: payload > Ayarlar varsayilanlari
+        margin = float(num(payload.get("margin_usdt"), WH["margin_usdt"]) or WH["margin_usdt"])
+        lev = int(num(payload.get("leverage"), WH["leverage"]) or WH["leverage"])
+        tp_type = (payload.get("tp_type") or WH["tp_type"]).lower()
+        sl_type = (payload.get("sl_type") or WH["sl_type"]).lower()
+        tp_val = num(payload.get("tp_value"), WH["tp_value"])
+        sl_val = num(payload.get("sl_value"), WH["sl_value"])
+        notional = margin * lev
+
+        # kasa kontrolu (kural havuzuyla ayni mantik)
+        balance = self.ex.free_usdt()
+        if balance is None:
+            return "SKIPPED:bakiye okunamadi"
+        est_price = self.ex.last_price(symbol)
+        new_risk = 150.0
+        if est_price:
+            slp = self._resolve_level(sl_type, sl_val, est_price, yon, is_tp=False)
+            if slp:
+                new_risk = abs(est_price - slp) / est_price * notional
+        total_risk = self.sl_risk_total() + new_risk
+        if balance - total_risk < CFG["rule_min_free"]:
+            sb_log_event("SIGNAL_SKIP", coin,
+                         f"webhook #{wid}: kasa yetersiz (bakiye={balance:.0f} risk={total_risk:.0f})")
+            tg_send(f"<b>WEBHOOK ATLANDI</b> {coin}\nKasa yetersiz: "
+                    f"bakiye ${balance:.0f}, toplam SL riski ${total_risk:.0f}")
+            return "SKIPPED:kasa yetersiz"
+
+        acilan = self.open_position(
+            coin=coin, symbol=symbol, side=yon,
+            margin=margin, leverage=lev,
+            tp_price=tp_val if tp_type == "price" else None,
+            sl_price=sl_val if sl_type == "price" else None,
+            tp_pct=tp_val if tp_type == "pct" else None,
+            sl_pct=sl_val if sl_type == "pct" else None,
+            source="rule", rule_id=None,
+            signal_id=None, signal_type=f"WEBHOOK_{wid}",
+            dyn_tp=extract_dynamic(self.settings_row, "wh_dyn_tp"),
+            dyn_sl=extract_dynamic(self.settings_row, "wh_dyn_sl"),
+        )
+        return "OPENED" if acilan else "ERROR:pozisyon acilamadi"
+
+    # ------------------------------------------------------------------
     # ORTAK POZISYON ACMA
     # ------------------------------------------------------------------
     def open_position(self, coin, symbol, side, margin, leverage,
@@ -1441,7 +1617,7 @@ class Bot:
         if not fill:
             log(f"{coin} emir acilamadi", "ERROR")
             sb_log_event("ERROR", coin, f"{source}: emir acilamadi")
-            return
+            return False
 
         entry = fill["price"]
         amount = fill["amount"]
@@ -1469,7 +1645,7 @@ class Bot:
             self.ex.close_market(symbol, side, amount)
             sb_log_event("ERROR", coin, f"tp/sl mantiksiz: giris={entry} tp={tp} sl={sl}")
             tg_send(f"<b>ACIL KAPATMA</b> {coin}\nTP/SL seviyeleri girise gore mantiksiz.")
-            return
+            return False
 
         # AND modu: hard emir Binance'e gonderilmez, bot ikisini birlikte izler
         tp_and = bool(dyn_tp and (dyn_tp.get("mode") or "OR").upper() == "AND")
@@ -1483,7 +1659,7 @@ class Bot:
             self.ex.close_market(symbol, side, amount)
             sb_log_event("ERROR", coin, "SL kurulamadi, acil kapatildi")
             tg_send(f"<b>ACIL KAPATMA</b> {coin}\nSL emri kurulamadi.")
-            return
+            return False
 
         if sl_and:
             log(f"{coin} SL emri Binance'e GONDERILMEDI (dinamik SL AND modu) - "
@@ -1516,6 +1692,7 @@ class Bot:
                 f"Kaynak: {source}{f' (kural {rule_id})' if rule_id else ''}\n"
                 f"Giris: {entry}\nMiktar: {amount}\n"
                 f"TP: {prot['tp_price']}\nSL: {prot['sl_price']}")
+        return True
 
 
 # ======================================================================
