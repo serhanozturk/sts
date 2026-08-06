@@ -102,21 +102,26 @@ TESTNET         = _env_b("BOT_TESTNET", "true")
 TESTNET_URL     = (_env("BOT_TESTNET_URL", "https://demo-fapi.binance.com") or "").rstrip("/")
 
 # --- Sinyal havuzu stratejisi (backtest ile sabitlendi) ---
-MARGIN_USDT     = _env_f("BOT_MARGIN_USDT", 100)
-LEVERAGE        = _env_i("BOT_LEVERAGE", 10)
-MARGIN_MODE     = _env("BOT_MARGIN_MODE", "cross")
-TP_PCT          = _env_f("BOT_TP_PCT", 10.0)
-SL_PCT          = _env_f("BOT_SL_PCT", 15.0)
-MAX_POSITIONS   = _env_i("BOT_MAX_POSITIONS", 4)        # sinyal havuzu
-MIN_BALANCE     = _env_f("BOT_MIN_BALANCE", 900)
-DEDUP_DAYS      = _env_f("BOT_DEDUP_DAYS", 2)
-POLL_SECONDS    = _env_i("BOT_POLL_SECONDS", 20)
-SIGNAL_TYPES    = [s.strip() for s in _env("BOT_SIGNAL_TYPES", "PUMP_1H,PUMP_15M").split(",") if s.strip()]
-STRENGTH        = _env("BOT_STRENGTH", "strong")
+# --- Strateji ayarlari: ONCE env varsayilanlari, SONRA Supabase sts_settings
+#     ile ustune yazilir. Supabase'e ulasilamazsa env degerleri gecerli kalir.
+CFG = {
+    "margin_usdt":        _env_f("BOT_MARGIN_USDT", 100),
+    "leverage":           _env_i("BOT_LEVERAGE", 10),
+    "margin_mode":        _env("BOT_MARGIN_MODE", "cross"),
+    "tp_pct":             _env_f("BOT_TP_PCT", 10.0),
+    "sl_pct":             _env_f("BOT_SL_PCT", 15.0),
+    "max_positions":      _env_i("BOT_MAX_POSITIONS", 4),
+    "max_rule_positions": _env_i("BOT_MAX_RULE_POSITIONS", 10),
+    "min_balance":        _env_f("BOT_MIN_BALANCE", 900),
+    "rule_min_free":      _env_f("BOT_RULE_MIN_FREE", 100),
+    "dedup_days":         _env_f("BOT_DEDUP_DAYS", 2),
+    "signal_types":       [s.strip() for s in _env("BOT_SIGNAL_TYPES", "PUMP_1H,PUMP_15M").split(",") if s.strip()],
+    "strength":           _env("BOT_STRENGTH", "strong"),
+    "poll_seconds":       _env_i("BOT_POLL_SECONDS", 20),
+}
+SETTINGS_POLL_SEC = _env_i("BOT_SETTINGS_POLL_SEC", 30)
 
-# --- Ozel kural havuzu ---
-MAX_RULE_POS    = _env_i("BOT_MAX_RULE_POSITIONS", 10)
-RULE_MIN_FREE   = _env_f("BOT_RULE_MIN_FREE", 100)      # SL riskleri sonrasi min bakiye
+# --- Ozel kural havuzu (panelden degistirilmeyen sabitler) ---
 RULE_LIMIT      = _env_i("BOT_RULE_LIMIT", 50)          # aktif kural ust siniri
 RULE_POLL_SEC   = _env_i("BOT_RULE_POLL_SEC", 30)       # kural listesi yenileme
 
@@ -132,8 +137,6 @@ TG_ON           = bool(TG_TOKEN and TG_CHAT_IDS)
 
 # --- Dosyalar ---
 STOP_FLAG       = _env("BOT_STOP_FLAG", "bot_stop.flag")   # yerel acil yedek
-
-POSITION_USDT   = MARGIN_USDT * LEVERAGE
 
 TF_SECONDS = {"5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
 
@@ -227,10 +230,10 @@ def sb_upsert_status(payload):
 # --- sinyal havuzu ---
 
 def sb_fetch_new_signals(last_id):
-    types = ",".join(SIGNAL_TYPES)
+    types = ",".join(CFG["signal_types"])
     path = (f"screener_signals?id=gt.{last_id}"
             f"&signal_type=in.({types})"
-            f"&strength=eq.{STRENGTH}"
+            f"&strength=eq.{CFG['strength']}"
             f"&notified=is.true"
             f"&order=id.asc&limit=50")
     rows = sb_request("GET", path)
@@ -291,6 +294,60 @@ def sb_get_control():
     if rows and len(rows) > 0:
         return rows[0]
     return None
+
+
+def sb_get_settings():
+    """sts_settings tablosundan strateji ayarlarini oku (tek satir, id=1)."""
+    rows = sb_request("GET", "sts_settings?id=eq.1&limit=1")
+    if rows and len(rows) > 0:
+        return rows[0]
+    return None
+
+
+SETTINGS_NUM = {
+    "margin_usdt": float, "leverage": int, "tp_pct": float, "sl_pct": float,
+    "max_positions": int, "max_rule_positions": int,
+    "min_balance": float, "rule_min_free": float,
+    "dedup_days": float, "poll_seconds": int,
+}
+
+
+def apply_settings(row):
+    """Supabase satirini CFG'ye uygula. Gecersiz/eksik alan env degerini korur.
+    Doner: degisen alanlarin listesi."""
+    if not row:
+        return []
+    changed = []
+    for key, caster in SETTINGS_NUM.items():
+        if key not in row or row[key] is None:
+            continue
+        try:
+            val = caster(row[key])
+        except (TypeError, ValueError):
+            continue
+        if val <= 0:                      # sifir/negatif ayar kabul edilmez
+            continue
+        if CFG.get(key) != val:
+            CFG[key] = val
+            changed.append(key)
+
+    mm = (row.get("margin_mode") or "").strip().lower()
+    if mm in ("cross", "isolated") and CFG["margin_mode"] != mm:
+        CFG["margin_mode"] = mm
+        changed.append("margin_mode")
+
+    st = (row.get("strength") or "").strip()
+    if st and CFG["strength"] != st:
+        CFG["strength"] = st
+        changed.append("strength")
+
+    raw = row.get("signal_types") or ""
+    types = [s.strip().upper() for s in str(raw).split(",") if s.strip()]
+    if types and CFG["signal_types"] != types:
+        CFG["signal_types"] = types
+        changed.append("signal_types")
+
+    return changed
 
 
 def sb_update_control(fields):
@@ -414,8 +471,8 @@ class Exchange:
         return None
 
     def configure_symbol(self, symbol, leverage=None, margin_mode=None):
-        lev = leverage or LEVERAGE
-        mm = margin_mode or MARGIN_MODE
+        lev = leverage or CFG["leverage"]
+        mm = margin_mode or CFG["margin_mode"]
         tag = (symbol, lev, mm)
         if tag in self._configured:
             return
@@ -629,14 +686,26 @@ def eval_conditions(rule, ctx):
             note = f"fiyat={lp} {op} {p2} -> {ok}"
         elif t == "oi_change":
             chg = ctx.get("oi_change_pct")
-            ok = compare(chg, op, p2)
+            # deger her zaman pozitif girilir, yonu operator belirler:
+            #   ">" 5 -> ortalamadan %5 BUYUK   |   "<" 7 -> ortalamadan %7 KUCUK
+            esik = abs(p2) if p2 is not None else None
+            if esik is not None and op in ("<", "<="):
+                esik = -esik
+            ok = compare(chg, op, esik)
+            yon = "buyuk" if op in (">", ">=") else "kucuk"
             note = (f"oi son {int(p1 or 3)} bar ort. gore="
-                    f"{chg if chg is None else round(chg,2)}% {op} {p2}% -> {ok}")
+                    f"{chg if chg is None else round(chg,2)}% "
+                    f"(esik %{p2} {yon}) -> {ok}")
         elif t == "volume":
             chg = ctx.get("vol_change_pct")
-            ok = compare(chg, op, p2)
+            esik = abs(p2) if p2 is not None else None
+            if esik is not None and op in ("<", "<="):
+                esik = -esik
+            ok = compare(chg, op, esik)
+            yon = "buyuk" if op in (">", ">=") else "kucuk"
             note = (f"hacim son {int(p1 or 3)} bar ort. gore="
-                    f"{chg if chg is None else round(chg,2)}% {op} {p2}% -> {ok}")
+                    f"{chg if chg is None else round(chg,2)}% "
+                    f"(esik %{p2} {yon}) -> {ok}")
         elif t == "funding":
             f = ctx.get("funding_pct")
             ok = compare(f, op, p2)
@@ -666,6 +735,8 @@ class Bot:
         self.open_trades = {}        # unified_symbol -> trade row
         self.rules = []              # aktif kurallar (cache)
         self.rules_loaded_at = 0
+        self.settings_loaded_at = 0
+        self.settings_warned = False
         self.rule_last_bar = {}      # rule_id -> son degerlendirilen bar id
         self.kline_cache = {}        # (sym, tf) -> (bar_id, ohlcv)
         self._restore_open_trades()
@@ -687,6 +758,26 @@ class Bot:
         if ctrl and self.last_signal_id is None and ctrl.get("last_signal_id") is not None:
             self.last_signal_id = int(ctrl["last_signal_id"])
         return ctrl
+
+    def refresh_settings(self, force=False):
+        """Strateji ayarlarini Supabase'den oku (SETTINGS_POLL_SEC araligiyla).
+        Ulasilamazsa mevcut CFG (env varsayilanlari) korunur."""
+        nowt = time.time()
+        if not force and nowt - self.settings_loaded_at < SETTINGS_POLL_SEC:
+            return
+        self.settings_loaded_at = nowt
+        row = sb_get_settings()
+        if row is None:
+            if not self.settings_warned:
+                log("Ayarlar okunamadi - env varsayilanlari kullaniliyor", "WARN")
+                self.settings_warned = True
+            return
+        self.settings_warned = False
+        changed = apply_settings(row)
+        if changed:
+            ozet = ", ".join(f"{k}={CFG[k]}" for k in changed)
+            log(f"Ayarlar guncellendi: {ozet}")
+            sb_log_event("SETTINGS", None, ozet)
 
     def init_last_id(self):
         self.refresh_control()
@@ -731,18 +822,22 @@ class Bot:
 
     # ------------------------------------------------------------------
     def run(self):
+        self.refresh_settings(force=True)   # log satiri guncel ayarlari gostersin
         mode = "TESTNET" if TESTNET else "CANLI"
         log(f"STS EXECUTOR {VERSION} basladi | mod={mode} | "
-            f"sinyal: ${MARGIN_USDT} x{LEVERAGE} {MARGIN_MODE} TP-{TP_PCT}% SL+{SL_PCT}% max={MAX_POSITIONS} | "
-            f"kural havuzu max={MAX_RULE_POS}")
+            f"sinyal: ${CFG['margin_usdt']} x{CFG['leverage']} {CFG['margin_mode']} "
+            f"TP-{CFG['tp_pct']}% SL+{CFG['sl_pct']}% max={CFG['max_positions']} | "
+            f"kural havuzu max={CFG['max_rule_positions']}")
         tg_send(f"<b>STS basladi</b> ({mode})\n"
-                f"Sinyal: ${MARGIN_USDT} x{LEVERAGE} | TP -{TP_PCT}% SL +{SL_PCT}% | max {MAX_POSITIONS}\n"
-                f"Kural havuzu: max {MAX_RULE_POS}")
+                f"Sinyal: ${CFG['margin_usdt']} x{CFG['leverage']} | "
+                f"TP -{CFG['tp_pct']}% SL +{CFG['sl_pct']}% | max {CFG['max_positions']}\n"
+                f"Kural havuzu: max {CFG['max_rule_positions']}")
         self.init_last_id()
 
         while self.running:
             try:
                 self.refresh_control()
+                self.refresh_settings()
                 live = self.check_closed_positions()
                 self.write_status(live)
                 self.refresh_rules()
@@ -754,7 +849,7 @@ class Bot:
             except Exception as e:
                 log(f"Dongu hatasi: {e}", "ERROR")
                 sb_log_event("ERROR", None, f"dongu: {e}")
-            for _ in range(POLL_SECONDS):
+            for _ in range(int(CFG["poll_seconds"])):
                 if not self.running:
                     break
                 time.sleep(1)
@@ -804,8 +899,8 @@ class Bot:
             "testnet": TESTNET,
             "killswitch": self.stopped(),
             "balance": balance,
-            "sig_count": sig_count, "sig_max": MAX_POSITIONS,
-            "rule_count": rule_count, "rule_max": MAX_RULE_POS,
+            "sig_count": sig_count, "sig_max": CFG["max_positions"],
+            "rule_count": rule_count, "rule_max": CFG["max_rule_positions"],
             "positions": positions,
         })
 
@@ -892,9 +987,9 @@ class Bot:
             return
 
         sig_count, _ = self.count_pools(live)
-        if sig_count >= MAX_POSITIONS:
-            log(f"{coin} atlandi - sinyal havuzu dolu ({MAX_POSITIONS})", "WARN")
-            sb_log_event("SIGNAL_SKIP", coin, f"sinyal havuzu dolu ({sig_count}/{MAX_POSITIONS})")
+        if sig_count >= CFG["max_positions"]:
+            log(f"{coin} atlandi - sinyal havuzu dolu ({CFG['max_positions']})", "WARN")
+            sb_log_event("SIGNAL_SKIP", coin, f"sinyal havuzu dolu ({sig_count}/{CFG['max_positions']})")
             tg_send(f"<b>ATLANDI</b> {coin} ({stype})\nSebep: sinyal havuzu dolu")
             return
 
@@ -902,23 +997,23 @@ class Bot:
         if balance is None:
             sb_log_event("SIGNAL_SKIP", coin, "bakiye okunamadi")
             return
-        if balance < MIN_BALANCE:
-            log(f"{coin} atlandi - bakiye ${balance:.2f} < ${MIN_BALANCE}", "WARN")
-            sb_log_event("SIGNAL_SKIP", coin, f"bakiye yetersiz ({balance:.0f}/{MIN_BALANCE})")
+        if balance < CFG["min_balance"]:
+            log(f"{coin} atlandi - bakiye ${balance:.2f} < ${CFG['min_balance']}", "WARN")
+            sb_log_event("SIGNAL_SKIP", coin, f"bakiye yetersiz ({balance:.0f}/{CFG['min_balance']})")
             tg_send(f"<b>ATLANDI</b> {coin} ({stype})\nSebep: bakiye ${balance:.2f}")
             return
 
-        recent = sb_recent_trade_coins(DEDUP_DAYS)
+        recent = sb_recent_trade_coins(CFG["dedup_days"])
         if coin in recent:
-            log(f"{coin} atlandi - son {DEDUP_DAYS} gun icinde islem gordu")
-            sb_log_event("SIGNAL_SKIP", coin, f"dedup ({DEDUP_DAYS} gun)")
+            log(f"{coin} atlandi - son {CFG['dedup_days']} gun icinde islem gordu")
+            sb_log_event("SIGNAL_SKIP", coin, f"dedup ({CFG['dedup_days']} gun)")
             return
 
         self.open_position(
             coin=coin, symbol=symbol, side="SHORT",
-            margin=MARGIN_USDT, leverage=LEVERAGE,
+            margin=CFG["margin_usdt"], leverage=CFG["leverage"],
             tp_price=None, sl_price=None,
-            tp_pct=TP_PCT, sl_pct=SL_PCT,
+            tp_pct=CFG["tp_pct"], sl_pct=CFG["sl_pct"],
             source="signal", rule_id=None,
             signal_id=sig.get("id"), signal_type=stype,
         )
@@ -1067,14 +1162,14 @@ class Bot:
             return
 
         _, rule_count = self.count_pools(live)
-        if rule_count >= MAX_RULE_POS:
-            log(f"Kural {rid}: ozel havuz dolu ({MAX_RULE_POS})", "WARN")
+        if rule_count >= CFG["max_rule_positions"]:
+            log(f"Kural {rid}: ozel havuz dolu ({CFG['max_rule_positions']})", "WARN")
             sb_log_event("SIGNAL_SKIP", coin, f"kural {rid}: ozel havuz dolu")
-            tg_send(f"<b>KURAL ATLANDI</b> {coin}\nOzel havuz dolu ({rule_count}/{MAX_RULE_POS})")
+            tg_send(f"<b>KURAL ATLANDI</b> {coin}\nOzel havuz dolu ({rule_count}/{CFG['max_rule_positions']})")
             return
 
         margin = float(num(rule.get("margin_usdt"), 100) or 100)
-        lev = int(num(rule.get("leverage"), LEVERAGE) or LEVERAGE)
+        lev = int(num(rule.get("leverage"), CFG["leverage"]) or CFG["leverage"])
         notional = margin * lev
 
         # dinamik kasa: mevcut SL riskleri + bu pozisyonun SL riski
@@ -1090,7 +1185,7 @@ class Bot:
             if slp:
                 new_risk = abs(est_price - slp) / est_price * notional
         total_risk = self.sl_risk_total() + new_risk
-        if balance - total_risk < RULE_MIN_FREE:
+        if balance - total_risk < CFG["rule_min_free"]:
             log(f"Kural {rid}: kasa yetersiz (bakiye {balance:.0f}, risk {total_risk:.0f})", "WARN")
             sb_log_event("SIGNAL_SKIP", coin,
                          f"kural {rid}: kasa yetersiz (bakiye={balance:.0f} risk={total_risk:.0f})")
