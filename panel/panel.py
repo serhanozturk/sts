@@ -163,7 +163,7 @@ def sb_delete(path):
 COND_TYPES = {"ema_cross", "rsi", "price", "oi_change", "volume", "funding"}
 OPS = {"<", ">", "<=", ">="}
 TIMEFRAMES = {"5m", "15m", "30m", "1h", "4h", "1d"}
-NEEDS_P1 = {"ema_cross", "rsi", "oi_change", "volume"}
+NEEDS_P1 = {"ema_cross", "oi_change", "volume"}   # rsi periyodu sabit 14
 
 
 def _num(v):
@@ -459,6 +459,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
   gap:11px;margin-bottom:11px}
 .crow{display:grid;grid-template-columns:150px 82px 62px 1fr 34px;gap:7px;
   align-items:center;margin-bottom:7px}
+.crow.single{grid-template-columns:150px 62px 1fr 34px}
 .cunit{position:relative;display:flex;align-items:center}
 .cunit input{padding-right:30px}
 .cunit .u{position:absolute;right:10px;font-size:11px;font-weight:600;
@@ -482,7 +483,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
   body{padding:10px}
   .brand{font-size:19px}
   .met .v{font-size:22px}
-  .crow{grid-template-columns:1fr 1fr;gap:6px}
+  .crow,.crow.single{grid-template-columns:1fr 1fr;gap:6px}
   .crow>*:first-child{grid-column:1/-1}
   .crow .xbtn{grid-column:1/-1}
   th,td{padding:8px 7px;font-size:11px}
@@ -792,12 +793,12 @@ function render(){
 
 /* ---------- kosul tanimlari ---------- */
 var CT={
-  ema_cross:{ad:'EMA kesisimi', p1:'Hizli', p2:'Yavas', u1:'', u2:'', d1:7,  d2:30,  op:'<'},
-  rsi:      {ad:'RSI',           p1:'Periyot', p2:'Esik', u1:'', u2:'', d1:14, d2:35,  op:'<'},
-  price:    {ad:'Fiyat',         p1:null, p2:'Fiyat', u1:'', u2:'$', d1:null, d2:'',  op:'<'},
-  oi_change:{ad:'OI degisimi',   p1:'Mum', p2:'Degisim', u1:'', u2:'%', d1:3, d2:-5,  op:'<='},
-  volume:   {ad:'Hacim',         p1:'Ort. mum', p2:'Carpan', u1:'', u2:'x', d1:20, d2:3, op:'>='},
-  funding:  {ad:'Funding',       p1:null, p2:'Oran', u1:'', u2:'%', d1:null, d2:-0.05, op:'<'}
+  ema_cross:{ad:'EMA kesisimi', p1:'Hizli', p2:'Yavas',  u2:'',  d1:7,   d2:30,    op:'<'},
+  rsi:      {ad:'RSI',          p1:null,    p2:'Esik',   u2:'',  d1:null,d2:70,    op:'>'},
+  price:    {ad:'Fiyat',        p1:null,    p2:'Fiyat',  u2:'$', d1:null,d2:'',    op:'<'},
+  oi_change:{ad:'OI degisimi',  p1:'Bar',   p2:'Degisim',u2:'%', d1:3,   d2:5,     op:'>'},
+  volume:   {ad:'Hacim',        p1:'Bar',   p2:'Degisim',u2:'%', d1:3,   d2:5,     op:'>'},
+  funding:  {ad:'Funding',      p1:null,    p2:'Oran',   u2:'%', d1:null,d2:-0.05, op:'<'}
 };
 
 function condText(conds,logic){
@@ -806,9 +807,9 @@ function condText(conds,logic){
   var txt=conds.map(function(c){
     var t=c.type;
     if(t==='ema_cross')return 'EMA'+c.p1+' '+c.op+' EMA'+c.p2;
-    if(t==='rsi')return 'RSI'+c.p1+' '+c.op+' '+c.p2;
-    if(t==='oi_change')return 'OI('+c.p1+'mum) '+c.op+' '+c.p2+'%';
-    if(t==='volume')return 'Hacim '+c.op+' '+c.p2+'x';
+    if(t==='rsi')return 'RSI '+c.op+' '+c.p2;
+    if(t==='oi_change')return 'OI('+c.p1+'bar ort) '+c.op+' '+c.p2+'%';
+    if(t==='volume')return 'Hacim('+c.p1+'bar ort) '+c.op+' '+c.p2+'%';
     if(t==='funding')return 'Funding '+c.op+' '+c.p2+'%';
     if(t==='price')return 'Fiyat '+c.op+' $'+c.p2;
     return t+' '+c.op+' '+c.p2;
@@ -838,7 +839,7 @@ function condRow(c){
     return '<option value="'+o+'"'+((c&&c.op===o)?' selected':'')+'>'+o+'</option>';
   }).join('');
   d.innerHTML='<select class="c-type" onchange="onTypeChange(this)">'+opts+'</select>'
-    +'<div class="cunit"><input class="c-p1"><span class="u u1"></span></div>'
+    +'<div class="cunit w1"><input class="c-p1"></div>'
     +'<select class="c-op">'+ops+'</select>'
     +'<div class="cunit"><input class="c-p2"><span class="u u2"></span></div>'
     +'<button class="xbtn" onclick="rmCond(this)" title="Kosulu sil">&times;</button>';
@@ -847,20 +848,22 @@ function condRow(c){
 function fillRow(row,c,useDefaults){
   var t=row.querySelector('.c-type').value, def=CT[t];
   var p1=row.querySelector('.c-p1'), p2=row.querySelector('.c-p2');
-  row.querySelector('.u1').textContent=def.u1;
-  row.querySelector('.u2').textContent=def.u2;
-  p1.disabled = def.p1===null;
-  p1.placeholder = def.p1===null?'—':def.p1;
+  var w1=row.querySelector('.w1');
+  var tek = def.p1===null;
+  row.classList.toggle('single', tek);
+  w1.style.display = tek?'none':'';
+  row.querySelector('.u2').textContent=def.u2||'';
+  p1.placeholder = tek?'':def.p1;
   p2.placeholder = def.p2;
   if(useDefaults){
-    p1.value = def.p1===null?'':(def.d1===null?'':def.d1);
+    p1.value = tek?'':(def.d1===null?'':def.d1);
     p2.value = def.d2===null?'':def.d2;
     row.querySelector('.c-op').value=def.op;
   }else if(c){
     p1.value = (c.p1===null||c.p1===undefined)?'':c.p1;
     p2.value = (c.p2===null||c.p2===undefined)?'':c.p2;
   }
-  if(def.p1===null)p1.value='';
+  if(tek)p1.value='';
 }
 function onTypeChange(sel){ fillRow(sel.parentNode,null,true); }
 function addCond(c){
