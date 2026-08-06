@@ -559,6 +559,20 @@ class Exchange:
         except Exception:
             return 0
 
+    def max_amount(self, symbol):
+        """Emir basina maksimum miktar: LOT_SIZE ve MARKET_LOT_SIZE'in kucugu.
+        Bilinmiyorsa None doner."""
+        try:
+            limits = self.markets[symbol].get("limits", {}) or {}
+            adaylar = []
+            for anahtar in ("amount", "market"):
+                mx = (limits.get(anahtar) or {}).get("max")
+                if mx:
+                    adaylar.append(float(mx))
+            return min(adaylar) if adaylar else None
+        except Exception:
+            return None
+
     # --- emirler ---
     def market_order(self, symbol, side, notional_usdt):
         """side: 'sell' (short ac) | 'buy' (long ac)."""
@@ -570,12 +584,30 @@ class Exchange:
         if amount <= 0:
             log(f"{symbol} miktar 0 cikti (fiyat {price}) - atlandi", "WARN")
             return None
+
+        # maksimum miktar siniri: asilirsa limite kirp (sinyali kacirmamak icin)
+        kirpma = None
+        mx = self.max_amount(symbol)
+        if mx and amount > mx:
+            yeni = float(self.ex.amount_to_precision(symbol, mx))
+            if yeni <= 0:
+                log(f"{symbol} max miktar limiti gecersiz ({mx}) - atlandi", "WARN")
+                return None
+            kirpma = {"istenen": amount, "uygulanan": yeni,
+                      "istenen_usdt": notional_usdt, "uygulanan_usdt": yeni * price}
+            log(f"{symbol} max miktar siniri: {amount} -> {yeni} "
+                f"(${notional_usdt:.0f} -> ${yeni*price:.0f})", "WARN")
+            amount = yeni
+
         min_cost = self.min_notional(symbol)
         if min_cost and amount * price < min_cost:
             log(f"{symbol} minNotional altinda ({amount*price:.2f} < {min_cost}) - atlandi", "WARN")
             return None
         order = self.ex.create_order(symbol, "market", side, amount)
-        return self._fill_info(symbol, order, amount)
+        fill = self._fill_info(symbol, order, amount)
+        if fill and kirpma:
+            fill["kirpma"] = kirpma
+        return fill
 
     def _fill_info(self, symbol, order, fallback_amount):
         avg = order.get("average") or order.get("price")
@@ -591,25 +623,30 @@ class Exchange:
             avg = self.last_price(symbol)
         return {"id": order.get("id"), "price": float(avg), "amount": float(filled)}
 
-    def place_tp_sl(self, symbol, pos_side, tp_price, sl_price):
+    def place_tp_sl(self, symbol, pos_side, tp_price, sl_price,
+                    send_tp=True, send_sl=True):
         """pos_side: 'SHORT' | 'LONG'. Fiyatlar mutlak.
-        closePosition=true -> pozisyon kapaninca karsi emir otomatik iptal."""
+        closePosition=true -> pozisyon kapaninca karsi emir otomatik iptal.
+        send_tp/send_sl=False: seviye hesaplanir ama Binance'e emir GONDERILMEZ
+        (dinamik cikis AND modunda kullanilir; bot kendisi izler)."""
         close_side = "buy" if pos_side == "SHORT" else "sell"
         tp = float(self.ex.price_to_precision(symbol, tp_price))
         sl = float(self.ex.price_to_precision(symbol, sl_price))
         tp_id = sl_id = None
-        try:
-            o = self.ex.create_order(symbol, "TAKE_PROFIT_MARKET", close_side, None, None,
-                                     {"stopPrice": tp, "closePosition": True})
-            tp_id = o.get("id")
-        except Exception as e:
-            log(f"{symbol} TP emri BASARISIZ: {e}", "ERROR")
-        try:
-            o = self.ex.create_order(symbol, "STOP_MARKET", close_side, None, None,
-                                     {"stopPrice": sl, "closePosition": True})
-            sl_id = o.get("id")
-        except Exception as e:
-            log(f"{symbol} SL emri BASARISIZ: {e}", "ERROR")
+        if send_tp:
+            try:
+                o = self.ex.create_order(symbol, "TAKE_PROFIT_MARKET", close_side, None, None,
+                                         {"stopPrice": tp, "closePosition": True})
+                tp_id = o.get("id")
+            except Exception as e:
+                log(f"{symbol} TP emri BASARISIZ: {e}", "ERROR")
+        if send_sl:
+            try:
+                o = self.ex.create_order(symbol, "STOP_MARKET", close_side, None, None,
+                                         {"stopPrice": sl, "closePosition": True})
+                sl_id = o.get("id")
+            except Exception as e:
+                log(f"{symbol} SL emri BASARISIZ: {e}", "ERROR")
         return {"tp_price": tp, "sl_price": sl, "tp_id": tp_id, "sl_id": sl_id}
 
     def close_market(self, symbol, pos_side, amount):
@@ -626,6 +663,38 @@ class Exchange:
             self.ex.cancel_all_orders(symbol)
         except Exception as e:
             log(f"{symbol} emir iptali: {e}", "WARN")
+
+
+# ======================================================================
+# DINAMIK CIKIS YAPILANDIRMASI
+# ======================================================================
+
+def extract_dynamic(src_row, prefix):
+    """sts_rules veya sts_settings satirindan dinamik cikis blogunu cikar.
+    prefix: 'dyn_tp' | 'dyn_sl'. Pasif/eksikse None doner."""
+    if not src_row:
+        return None
+    if not src_row.get(f"{prefix}_active"):
+        return None
+    conds = src_row.get(f"{prefix}_conditions")
+    if isinstance(conds, str):
+        try:
+            conds = json.loads(conds)
+        except Exception:
+            conds = None
+    if not conds:
+        return None
+    mode = (src_row.get(f"{prefix}_mode") or "OR").upper()
+    if mode not in ("OR", "AND"):
+        mode = "OR"
+    tf = src_row.get(f"{prefix}_timeframe") or "5m"
+    if tf not in TF_SECONDS:
+        tf = "5m"
+    logic = (src_row.get(f"{prefix}_logic") or "AND").upper()
+    if logic not in ("AND", "OR"):
+        logic = "AND"
+    return {"active": True, "timeframe": tf, "conditions": conds,
+            "logic": logic, "mode": mode}
 
 
 # ======================================================================
@@ -737,7 +806,9 @@ class Bot:
         self.rules_loaded_at = 0
         self.settings_loaded_at = 0
         self.settings_warned = False
+        self.settings_row = None     # sinyal havuzu dinamik cikis yapilandirmasi
         self.rule_last_bar = {}      # rule_id -> son degerlendirilen bar id
+        self.dyn_last_bar = {}       # (trade_id, dyn_tp|dyn_sl) -> son bar id
         self.kline_cache = {}        # (sym, tf) -> (bar_id, ohlcv)
         self._restore_open_trades()
 
@@ -773,6 +844,7 @@ class Bot:
                 self.settings_warned = True
             return
         self.settings_warned = False
+        self.settings_row = row
         changed = apply_settings(row)
         if changed:
             ozet = ", ".join(f"{k}={CFG[k]}" for k in changed)
@@ -840,6 +912,7 @@ class Bot:
                 self.refresh_settings()
                 live = self.check_closed_positions()
                 self.write_status(live)
+                self.monitor_dynamic_exits(live)
                 self.refresh_rules()
                 if self.stopped():
                     log("KILL-SWITCH aktif - yeni pozisyon acilmiyor", "WARN")
@@ -945,6 +1018,176 @@ class Bot:
         sb_log_event("CLOSE", coin, f"{side} {reason} cikis={exit_price} pnl={pnl}")
         tg_send(f"<b>KAPANDI</b> {coin} {side}\nSebep: {reason}\nCikis: {exit_price}\nPnL: <b>{pnl_txt}</b>")
 
+    def build_ctx(self, symbol, tf, conds, bar_id):
+        """Kosullarin ihtiyac duydugu gosterge verisini topla (lazy + onbellekli).
+        Giris kurallari ve dinamik cikis ayni fonksiyonu kullanir."""
+        ctx = {}
+        cond_types = {(c.get("type") or "").lower() for c in conds}
+
+        need_kline = cond_types & {"ema_cross", "rsi", "price", "volume"}
+        if need_kline:
+            bars = required_bars(conds)
+            cache_key = (symbol, tf)
+            cached = self.kline_cache.get(cache_key)
+            if cached and cached[0] == bar_id:
+                ohlcv = cached[1]
+            else:
+                ohlcv = self.ex.ohlcv(symbol, tf, bars + 2)
+                if ohlcv:
+                    self.kline_cache[cache_key] = (bar_id, ohlcv)
+            if not ohlcv or len(ohlcv) < 3:
+                return None
+            closed = ohlcv[:-1]                # son eleman canli mum
+            ctx["closes"] = [c[4] for c in closed]
+            ctx["last_close"] = closed[-1][4]
+            vols = [c[5] for c in closed]
+            for c in conds:
+                if (c.get("type") or "").lower() == "volume":
+                    n = int(num(c.get("p1"), 3) or 3)
+                    if len(vols) > n:
+                        prev = vols[-(n + 1):-1]
+                        avg = sum(prev) / len(prev)
+                        if avg > 0:
+                            ctx["vol_change_pct"] = (vols[-1] - avg) / avg * 100.0
+                    break
+
+        if "oi_change" in cond_types:
+            for c in conds:
+                if (c.get("type") or "").lower() == "oi_change":
+                    n = int(num(c.get("p1"), 3) or 3)
+                    hist = self.ex.oi_history(symbol, tf, n + 2)
+                    if hist and len(hist) >= n + 1:
+                        vals = [h.get("openInterestValue") or h.get("openInterestAmount")
+                                for h in hist]
+                        vals = [float(v) for v in vals if v is not None]
+                        if len(vals) >= n + 1:
+                            prev = vals[-(n + 1):-1]
+                            avg = sum(prev) / len(prev)
+                            if avg > 0:
+                                ctx["oi_change_pct"] = (vals[-1] - avg) / avg * 100.0
+                    break
+
+        if "funding" in cond_types:
+            ctx["funding_pct"] = self.ex.funding_rate(symbol)
+
+        return ctx
+
+    # ------------------------------------------------------------------
+    # DINAMIK CIKIS
+    # ------------------------------------------------------------------
+    def monitor_dynamic_exits(self, live):
+        """Acik pozisyonlarda dinamik TP/SL kosullarini bar kapanisinda kontrol et."""
+        if live is None or not self.open_trades:
+            return
+        for sym in list(self.open_trades.keys()):
+            if sym not in live:
+                continue
+            trade = self.open_trades[sym]
+            for tag in ("dyn_tp", "dyn_sl"):
+                cfg = trade.get(tag)
+                if isinstance(cfg, str):
+                    try:
+                        cfg = json.loads(cfg)
+                    except Exception:
+                        cfg = None
+                if not cfg or not cfg.get("active"):
+                    continue
+                try:
+                    if self._check_dynamic(sym, trade, live[sym], tag, cfg):
+                        break          # pozisyon kapandi, digerine bakma
+                except Exception as e:
+                    log(f"{trade.get('coin', sym)} {tag} degerlendirme hatasi: {e}", "ERROR")
+
+    def _check_dynamic(self, symbol, trade, pos, tag, cfg):
+        """Tek bir dinamik blogu degerlendir. Kapatildiysa True doner."""
+        tf = cfg.get("timeframe") or "5m"
+        tf_sec = TF_SECONDS.get(tf)
+        if not tf_sec:
+            return False
+
+        conds = cfg.get("conditions") or []
+        if isinstance(conds, str):
+            try:
+                conds = json.loads(conds)
+            except Exception:
+                return False
+        if not conds:
+            return False
+
+        # bar takibi: her kapanmis mum icin bir kez
+        bar_id = int(time.time() // tf_sec)
+        anahtar = (trade.get("id") or symbol, tag)
+        if self.dyn_last_bar.get(anahtar) == bar_id:
+            return False
+        if time.time() - bar_id * tf_sec < 5:
+            return False
+        self.dyn_last_bar[anahtar] = bar_id
+
+        ctx = self.build_ctx(symbol, tf, conds, bar_id)
+        if ctx is None:
+            return False
+
+        ok, notes = eval_conditions({"conditions": conds,
+                                     "logic": cfg.get("logic") or "AND"}, ctx)
+        if not ok:
+            return False
+
+        # AND modu: hard seviyeye de ulasilmis olmali
+        mode = (cfg.get("mode") or "OR").upper()
+        if mode == "AND":
+            hard = trade.get("tp_price") if tag == "dyn_tp" else trade.get("sl_price")
+            mark = ctx.get("last_close") or self.ex.last_price(symbol)
+            if not hard or not mark:
+                return False
+            side = (trade.get("side") or "SHORT").upper()
+            if tag == "dyn_tp":
+                ulasti = mark <= float(hard) if side == "SHORT" else mark >= float(hard)
+            else:
+                ulasti = mark >= float(hard) if side == "SHORT" else mark <= float(hard)
+            if not ulasti:
+                return False
+            notes.append(f"AND: hard seviye {hard} ulasildi (fiyat {mark})")
+
+        coin = trade.get("coin", symbol)
+        sebep = "DYN_TP" if tag == "dyn_tp" else "DYN_SL"
+        aciklama = " | ".join(notes)
+        log(f"{sebep} TETIKLENDI {coin}: {aciklama}")
+        sb_log_event(sebep, coin, aciklama)
+
+        side = (trade.get("side") or "SHORT").upper()
+        amount = float(pos.get("contracts") or trade.get("amount") or 0)
+        if amount <= 0:
+            return False
+
+        self.ex.cancel_all(symbol)          # bekleyen hard emirleri temizle
+        res = self.ex.close_market(symbol, side, amount)
+        if not res:
+            log(f"{coin} {sebep} kapatma emri BASARISIZ", "ERROR")
+            sb_log_event("ERROR", coin, f"{sebep} kapatma basarisiz")
+            return False
+
+        cikis = None
+        try:
+            cikis = res.get("average") or res.get("price")
+        except Exception:
+            pass
+        if not cikis:
+            cikis = self.ex.last_price(symbol)
+
+        entry = float(trade.get("entry_price") or 0)
+        pnl = None
+        if entry and cikis:
+            pnl = round((entry - float(cikis)) * amount, 4) if side == "SHORT" \
+                else round((float(cikis) - entry) * amount, 4)
+
+        if trade.get("id"):
+            sb_close_trade(trade["id"], cikis, pnl, sebep)
+        self.open_trades.pop(symbol, None)
+
+        pnl_txt = f"{pnl:+.2f} USDT" if pnl is not None else "?"
+        tg_send(f"<b>{sebep}</b> {coin} {side}\nCikis: {cikis}\nPnL: <b>{pnl_txt}</b>\n{aciklama}")
+        return True
+
     # ------------------------------------------------------------------
     # HAVUZ 1 - SINYAL
     # ------------------------------------------------------------------
@@ -1016,6 +1259,8 @@ class Bot:
             tp_pct=CFG["tp_pct"], sl_pct=CFG["sl_pct"],
             source="signal", rule_id=None,
             signal_id=sig.get("id"), signal_type=stype,
+            dyn_tp=extract_dynamic(self.settings_row, "dyn_tp"),
+            dyn_sl=extract_dynamic(self.settings_row, "dyn_sl"),
         )
 
     # ------------------------------------------------------------------
@@ -1084,54 +1329,10 @@ class Bot:
                 conds = json.loads(conds)
             except Exception:
                 conds = []
-        cond_types = {(c.get("type") or "").lower() for c in conds}
-
-        # --- veri topla (lazy) ---
-        ctx = {}
-        need_kline = cond_types & {"ema_cross", "rsi", "price", "volume"}
-        if need_kline:
-            bars = required_bars(conds)
-            cache_key = (symbol, tf)
-            cached = self.kline_cache.get(cache_key)
-            if cached and cached[0] == bar_id:
-                ohlcv = cached[1]
-            else:
-                ohlcv = self.ex.ohlcv(symbol, tf, bars + 2)
-                if ohlcv:
-                    self.kline_cache[cache_key] = (bar_id, ohlcv)
-            if not ohlcv or len(ohlcv) < 3:
-                return
-            closed = ohlcv[:-1]  # son eleman canli mum
-            ctx["closes"] = [c[4] for c in closed]
-            ctx["last_close"] = closed[-1][4]
-            vols = [c[5] for c in closed]
-            for c in conds:
-                if (c.get("type") or "").lower() == "volume":
-                    n = int(num(c.get("p1"), 3) or 3)
-                    if len(vols) > n:
-                        prev = vols[-(n + 1):-1]          # son bar haric N bar
-                        avg = sum(prev) / len(prev)
-                        if avg > 0:
-                            ctx["vol_change_pct"] = (vols[-1] - avg) / avg * 100.0
-                    break
-
-        if "oi_change" in cond_types:
-            for c in conds:
-                if (c.get("type") or "").lower() == "oi_change":
-                    n = int(num(c.get("p1"), 3) or 3)
-                    hist = self.ex.oi_history(symbol, tf, n + 2)
-                    if hist and len(hist) >= n + 1:
-                        vals = [h.get("openInterestValue") or h.get("openInterestAmount") for h in hist]
-                        vals = [float(v) for v in vals if v is not None]
-                        if len(vals) >= n + 1:
-                            prev = vals[-(n + 1):-1]      # son bar haric N bar
-                            avg = sum(prev) / len(prev)
-                            if avg > 0:
-                                ctx["oi_change_pct"] = (vals[-1] - avg) / avg * 100.0
-                    break
-
-        if "funding" in cond_types:
-            ctx["funding_pct"] = self.ex.funding_rate(symbol)
+        # --- veri topla (giris ve dinamik cikis ayni yardimciyi kullanir) ---
+        ctx = self.build_ctx(symbol, tf, conds, bar_id)
+        if ctx is None:
+            return
 
         # --- degerlendir ---
         ok, notes = eval_conditions(rule, ctx)
@@ -1201,6 +1402,8 @@ class Bot:
             sl_pct=self._val_if(rule, "sl", "pct"),
             source="rule", rule_id=rid,
             signal_id=None, signal_type=f"RULE_{rid}",
+            dyn_tp=extract_dynamic(rule, "dyn_tp"),
+            dyn_sl=extract_dynamic(rule, "dyn_sl"),
         )
 
     @staticmethod
@@ -1228,7 +1431,8 @@ class Bot:
     # ------------------------------------------------------------------
     def open_position(self, coin, symbol, side, margin, leverage,
                       tp_price, sl_price, tp_pct, sl_pct,
-                      source, rule_id, signal_id, signal_type):
+                      source, rule_id, signal_id, signal_type,
+                      dyn_tp=None, dyn_sl=None):
         self.ex.configure_symbol(symbol, leverage=leverage)
         notional = margin * leverage
         order_side = "sell" if side == "SHORT" else "buy"
@@ -1241,7 +1445,16 @@ class Bot:
 
         entry = fill["price"]
         amount = fill["amount"]
-        log(f"ACILDI {coin} {side} | giris {entry} | miktar {amount} | ${notional} | kaynak={source}")
+        gercek_notional = entry * amount
+        log(f"ACILDI {coin} {side} | giris {entry} | miktar {amount} | "
+            f"${gercek_notional:.0f} | kaynak={source}")
+
+        kirpma = fill.get("kirpma")
+        if kirpma:
+            mesaj = (f"borsa max miktar siniri nedeniyle pozisyon kucultuldu: "
+                     f"${kirpma['istenen_usdt']:.0f} -> ${kirpma['uygulanan_usdt']:.0f}")
+            sb_log_event("SIZE_CLIP", coin, mesaj)
+            tg_send(f"<b>POZISYON KUCULTULDU</b> {coin}\n{mesaj}")
 
         # TP/SL mutlak seviyeleri
         tp = tp_price if tp_price else self._resolve_level("pct", tp_pct, entry, side, is_tp=True)
@@ -1258,15 +1471,26 @@ class Bot:
             tg_send(f"<b>ACIL KAPATMA</b> {coin}\nTP/SL seviyeleri girise gore mantiksiz.")
             return
 
-        prot = self.ex.place_tp_sl(symbol, side, tp, sl)
+        # AND modu: hard emir Binance'e gonderilmez, bot ikisini birlikte izler
+        tp_and = bool(dyn_tp and (dyn_tp.get("mode") or "OR").upper() == "AND")
+        sl_and = bool(dyn_sl and (dyn_sl.get("mode") or "OR").upper() == "AND")
+        prot = self.ex.place_tp_sl(symbol, side, tp, sl,
+                                   send_tp=not tp_and, send_sl=not sl_and)
 
-        if not prot["sl_id"]:
+        if not sl_and and not prot["sl_id"]:
             log(f"{coin} SL kurulamadi - pozisyon KORUMASIZ, kapatiliyor", "ERROR")
             self.ex.cancel_all(symbol)
             self.ex.close_market(symbol, side, amount)
             sb_log_event("ERROR", coin, "SL kurulamadi, acil kapatildi")
             tg_send(f"<b>ACIL KAPATMA</b> {coin}\nSL emri kurulamadi.")
             return
+
+        if sl_and:
+            log(f"{coin} SL emri Binance'e GONDERILMEDI (dinamik SL AND modu) - "
+                f"koruma bota bagli", "WARN")
+            sb_log_event("SL_SOFT", coin, "dinamik SL AND modu: hard SL emri yok, koruma bota bagli")
+            tg_send(f"<b>DIKKAT</b> {coin}\nDinamik SL AND modunda - Binance'te SL emri yok, "
+                    f"koruma bot calistigi surece gecerli.")
 
         row = {
             "coin": coin, "symbol": symbol,
@@ -1278,6 +1502,7 @@ class Bot:
             "tp_price": prot["tp_price"], "sl_price": prot["sl_price"],
             "tp_order_id": str(prot["tp_id"]) if prot["tp_id"] else None,
             "sl_order_id": str(prot["sl_id"]) if prot["sl_id"] else None,
+            "dyn_tp": dyn_tp, "dyn_sl": dyn_sl,   # acilista donduruldu
             "testnet": TESTNET,
         }
         saved = sb_insert_trade(row)
