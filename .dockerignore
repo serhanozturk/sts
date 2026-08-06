@@ -1,5 +1,0 @@
-.env
-*.md
-test_*.py
-__pycache__
-bot_v1_backup.py
