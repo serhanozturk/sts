@@ -392,6 +392,7 @@ def gather_state():
         "settings": settings,
         "webhooks": webhooks,
         "webhook_enabled": bool(WEBHOOK_TOKEN),
+        "webhook_token": WEBHOOK_TOKEN,   # hazir mesaj uretmek icin (panel auth'lu)
         "trades": trades,
         "events": events,
         "rules": rules,
@@ -733,6 +734,10 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
 .mini:hover{border-color:var(--text2);color:var(--text)}
 .mini.del:hover{border-color:var(--coralBd);color:var(--coral);background:var(--coralBg)}
 .divider{border-top:1px solid var(--border);padding-top:12px;margin-top:12px}
+.cprow{display:flex;gap:8px;align-items:stretch;margin-top:4px}
+.cprow input,.cprow textarea{flex:1;font-family:'JetBrains Mono',monospace;
+  font-size:11px;line-height:1.5;resize:vertical}
+.cprow .btn{white-space:nowrap;align-self:flex-start}
 .dynbox{background:var(--bg);border:1px solid var(--border);border-radius:11px;
   padding:12px 14px;margin-bottom:10px}
 .dynhead{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
@@ -1152,13 +1157,29 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
         </div>
       </div>
     <div style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px">
-      <label>Pine Script alarm mesaji</label>
-      <textarea id="wh-sample" rows="3" readonly
-        style="width:100%;font-family:'JetBrains Mono',monospace;font-size:11px;
-        line-height:1.5;resize:vertical;margin-top:4px"></textarea>
-      <p style="font-size:11px;color:var(--text3);margin-top:6px">
-        TradingView alarm penceresinde "Webhook URL" alanina panel adresini + <b>/webhook</b> yaz,
-        mesaj kutusuna yukaridaki JSON'u koy. Token sunucu env'inde (WEBHOOK_TOKEN) tanimli olmali.
+      <label>Webhook URL</label>
+      <div class="cprow">
+        <input id="wh-url" readonly>
+        <button class="btn" onclick="kopyala('wh-url',this)">Kopyala</button>
+      </div>
+
+      <label style="margin-top:12px">Alarm mesaji &#8212; SHORT</label>
+      <div class="cprow">
+        <textarea id="wh-msg-short" rows="2" readonly class="mono"></textarea>
+        <button class="btn" onclick="kopyala('wh-msg-short',this)">Kopyala</button>
+      </div>
+
+      <label style="margin-top:10px">Alarm mesaji &#8212; LONG</label>
+      <div class="cprow">
+        <textarea id="wh-msg-long" rows="2" readonly class="mono"></textarea>
+        <button class="btn" onclick="kopyala('wh-msg-long',this)">Kopyala</button>
+      </div>
+
+      <p style="font-size:11px;color:var(--text3);margin-top:8px">
+        TradingView alarm penceresi: <b>Notifications</b> sekmesinde Webhook URL alanina
+        yukaridaki adresi, <b>Settings</b> sekmesindeki Message kutusuna ilgili JSON'u yapistir.
+        <code>{{ticker}}</code> TradingView tarafindan grafik sembolu ile degistirilir;
+        sabit bir coin istiyorsan onun yerine coin adini yaz.
       </p>
     </div>
   </div>
@@ -1233,6 +1254,24 @@ function pctTxt(v,d){
 }
 function cls(v){var x=n(v); return x===null?'mut':(x>0?'up':(x<0?'dn':'mut'))}
 function esc(s){var d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML}
+function kopyala(id,btn){
+  var el=document.getElementById(id);
+  var eski=btn.textContent;
+  function tamam(){ btn.textContent='Kopyalandi'; setTimeout(function(){btn.textContent=eski},1500); }
+  // HTTP'de navigator.clipboard olmayabilir - yedek yontem
+  if(navigator.clipboard&&window.isSecureContext){
+    navigator.clipboard.writeText(el.value).then(tamam).catch(function(){secKopyala(el,tamam)});
+  }else{ secKopyala(el,tamam); }
+}
+function secKopyala(el,cb){
+  el.removeAttribute('readonly');
+  el.select(); el.setSelectionRange(0,99999);
+  try{ document.execCommand('copy'); cb(); }
+  catch(e){ toast('Kopyalanamadi - elle secip kopyala'); }
+  el.setAttribute('readonly','');
+  window.getSelection().removeAllRanges();
+}
+
 function toast(m){
   var t=document.getElementById('toast');
   t.textContent=m;t.style.display='block';
@@ -1408,8 +1447,12 @@ function fillSettings(){
   var ws=document.getElementById('wh-state');
   if(state.webhook_enabled){ws.textContent='Aktif';ws.className='badge b-ok';}
   else{ws.textContent='Kapali - WEBHOOK_TOKEN yok';ws.className='badge b-off';}
-  document.getElementById('wh-sample').value=
-    '{"token":"<WEBHOOK_TOKEN>","coin":"{{ticker}}","direction":"SHORT"}';
+  var tok=state.webhook_token||'<WEBHOOK_TOKEN tanimli degil>';
+  document.getElementById('wh-url').value=location.origin+'/webhook';
+  document.getElementById('wh-msg-short').value=
+    '{"token":"'+tok+'","coin":"{{ticker}}","direction":"SHORT"}';
+  document.getElementById('wh-msg-long').value=
+    '{"token":"'+tok+'","coin":"{{ticker}}","direction":"LONG"}';
   settingsDirty=false;
   document.getElementById('s-errors').style.display='none';
 }
