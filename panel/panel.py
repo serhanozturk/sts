@@ -401,6 +401,59 @@ def gather_state():
 
 
 # ======================================================================
+# ACIK POZISYON YONETIMI
+# ======================================================================
+
+def validate_position_req(d):
+    """Panelden gelen pozisyon guncelleme istegini dogrula.
+    Doner: (alan_dict, hata_listesi)."""
+    err = []
+    out = {}
+
+    if d.get("close"):
+        out["req_close"] = True
+        out["req_at"] = datetime.now(timezone.utc).isoformat()
+        return out, []          # kapatma istegi tek basina yeter
+
+    for anahtar, alan, ad in (("tp_price", "req_tp_price", "TP"),
+                              ("sl_price", "req_sl_price", "SL")):
+        if anahtar not in d or d.get(anahtar) in (None, ""):
+            continue
+        v = _num(d.get(anahtar))
+        if v is None or v <= 0:
+            err.append(f"{ad} fiyati pozitif olmali")
+            continue
+        out[alan] = v
+
+    # dinamik cikis bloklari (dogrudan yazilir, executor okur)
+    for prefix, etiket in (("dyn_tp", "Dinamik TP"), ("dyn_sl", "Dinamik SL")):
+        if f"{prefix}_active" not in d:
+            continue
+        blok, derr = validate_dynamic(d, prefix, etiket)
+        if derr:
+            err += derr
+            continue
+        # bot_trades'te tek jsonb kolon olarak tutulur
+        if blok.get(f"{prefix}_active"):
+            out[prefix] = {
+                "active": True,
+                "timeframe": blok[f"{prefix}_timeframe"],
+                "conditions": blok[f"{prefix}_conditions"],
+                "logic": blok[f"{prefix}_logic"],
+                "mode": blok[f"{prefix}_mode"],
+            }
+        else:
+            out[prefix] = None
+
+    if err:
+        return None, err
+    if not out:
+        return None, ["degistirilecek alan yok"]
+    out["req_at"] = datetime.now(timezone.utc).isoformat()
+    return out, []
+
+
+# ======================================================================
 # WEBHOOK
 # ======================================================================
 
@@ -734,6 +787,8 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
 .mini:hover{border-color:var(--text2);color:var(--text)}
 .mini.del:hover{border-color:var(--coralBd);color:var(--coral);background:var(--coralBg)}
 .divider{border-top:1px solid var(--border);padding-top:12px;margin-top:12px}
+.pospanel{background:var(--surface);border:1px solid var(--border);border-radius:12px;
+  padding:14px 16px;margin:-4px 0 8px;box-shadow:var(--shadow);flex-basis:100%}
 .cprow{display:flex;gap:8px;align-items:stretch;margin-top:4px}
 .cprow input,.cprow textarea{flex:1;font-family:'JetBrains Mono',monospace;
   font-size:11px;line-height:1.5;resize:vertical}
@@ -1321,6 +1376,7 @@ function render(){
     box.innerHTML=pos.map(function(p){
       var u=n(p.upnl), m=n(p.margin);
       var pct=(u!==null&&m)?u/m*100:null;
+      var tid = p.trade_id||0;
       return '<div class="pos"><div class="pos-l">'
         +'<div class="pos-nm"><b>'+esc(p.coin)+'</b>'
         +'<span class="badge '+(p.side==='LONG'?'b-long':'b-short')+'">'+esc(p.side||'')+'</span>'
@@ -1334,7 +1390,9 @@ function render(){
         +'</div></div>'
         +'<div class="pos-r"><div class="pnl '+cls(u)+'">'+sgn(u)+'</div>'
         +(pct!==null?'<div class="pnl-pct '+cls(pct)+'">'+pctTxt(pct)+'</div>':'')
-        +'</div></div>';
+        +(tid?'<button class="mini" style="margin:6px 0 0" onclick="openPos('+tid+')">Yonet</button>':'')
+        +'</div></div>'
+        +(tid?posPanel(p,tid):'');
     }).join('');
   }
 
@@ -1528,6 +1586,102 @@ function importJson(){
     }).catch(function(){
       btn.disabled=false;btn.textContent='Ekle';
       box.innerHTML='&bull; Baglanti hatasi';box.style.display='block';
+    });
+}
+
+/* ---------- acik pozisyon yonetimi ---------- */
+function posPanel(p,tid){
+  return '<div id="pp-'+tid+'" class="pospanel" style="display:none">'
+    +'<div class="frow">'
+      +'<div><label>Hard TP</label><input id="pp-tp-'+tid+'" value="'+(p.tp==null?'':p.tp)+'"></div>'
+      +'<div><label>Hard SL</label><input id="pp-sl-'+tid+'" value="'+(p.sl==null?'':p.sl)+'"></div>'
+    +'</div>'
+    +'<div class="dynbox" style="margin-top:8px">'
+      +'<div class="dynhead">'
+        +'<label class="chk"><input type="checkbox" id="p'+tid+'tp-active" onchange="dynToggle(\'p'+tid+'tp\')"><span>Dinamik TP</span></label>'
+        +'<span class="dynhint">Bu pozisyona ozel</span></div>'
+      +'<div id="p'+tid+'tp-body" style="display:none">'+dynBody('p'+tid+'tp')+'</div>'
+    +'</div>'
+    +'<div class="dynbox">'
+      +'<div class="dynhead">'
+        +'<label class="chk"><input type="checkbox" id="p'+tid+'sl-active" onchange="dynToggle(\'p'+tid+'sl\')"><span>Dinamik SL</span></label>'
+        +'<span class="dynhint">Bu pozisyona ozel</span></div>'
+      +'<div id="p'+tid+'sl-body" style="display:none">'+dynBody('p'+tid+'sl')+'</div>'
+    +'</div>'
+    +'<div id="pp-err-'+tid+'" class="errbox"></div>'
+    +'<div style="display:flex;justify-content:space-between;gap:8px;margin-top:10px;flex-wrap:wrap">'
+      +'<button class="btn btn-stop" onclick="closePos('+tid+')">Pozisyonu kapat</button>'
+      +'<div style="display:flex;gap:8px">'
+        +'<button class="btn" onclick="hidePos('+tid+')">Kapat</button>'
+        +'<button class="btn btn-go" onclick="savePos('+tid+')">Kaydet</button>'
+      +'</div></div>'
+    +'</div>';
+}
+
+function dynBody(on){
+  return '<div class="frow" style="margin-top:10px">'
+    +'<div><label>Periyot</label><select id="'+on+'-tf">'
+      +'<option value="5m">5m</option><option value="15m">15m</option><option value="30m">30m</option>'
+      +'<option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>'
+    +'</select></div>'
+    +'<div><label>Hard ile iliski</label><select id="'+on+'-mode" onchange="dynModeWarn(\''+on+'\')">'
+      +'<option value="OR">VEYA - hangisi once gelirse</option>'
+      +'<option value="AND">VE - ikisi birden gerekli</option></select></div>'
+    +'<div><label>Kosul mantigi</label><select id="'+on+'-logic">'
+      +'<option value="-">&#8212; (tek kural)</option>'
+      +'<option value="AND">Ve</option><option value="OR">Veya</option></select></div>'
+    +'</div>'
+    +'<div id="'+on+'-conds"></div>'
+    +'<button class="btn" style="font-size:11px;padding:6px 12px;margin-top:6px" '
+      +'onclick="addCond(\''+on+'-conds\')">+ Kosul ekle</button>'
+    +'<div id="'+on+'-warn" class="warnbox" style="display:none">'
+      +'<b>VE modu uyarisi:</b> Bu modda hard seviye Binance\'e emir olarak GONDERILMEZ, '
+      +'bot her iki kosulu birlikte izler. Bot durursa bu koruma da durur.</div>';
+}
+
+var acikPos=null;
+function openPos(tid){
+  if(acikPos&&acikPos!==tid)hidePos(acikPos);
+  var el=document.getElementById('pp-'+tid);
+  if(!el)return;
+  if(el.style.display!=='none'){hidePos(tid);return;}
+  el.style.display='block';
+  acikPos=tid;
+  var t=(state.trades||[]).filter(function(x){return x.id===tid})[0]||{};
+  LOGIC_OF['p'+tid+'tp-conds']='p'+tid+'tp-logic';
+  LOGIC_OF['p'+tid+'sl-conds']='p'+tid+'sl-logic';
+  dynFill('p'+tid+'tp', t.dyn_tp);
+  dynFill('p'+tid+'sl', t.dyn_sl);
+}
+function hidePos(tid){
+  var el=document.getElementById('pp-'+tid);
+  if(el)el.style.display='none';
+  if(acikPos===tid)acikPos=null;
+}
+function savePos(tid){
+  var body=Object.assign({},
+    dynRead('p'+tid+'tp','dyn_tp'), dynRead('p'+tid+'sl','dyn_sl'),
+    {tp_price:document.getElementById('pp-tp-'+tid).value,
+     sl_price:document.getElementById('pp-sl-'+tid).value});
+  gonderPos(tid, body, 'Istek gonderildi - executor 20sn icinde uygular');
+}
+function closePos(tid){
+  var t=(state.trades||[]).filter(function(x){return x.id===tid})[0]||{};
+  if(!confirm((t.coin||'Pozisyon')+' kapatilsin mi?\nBu islem geri alinamaz.'))return;
+  gonderPos(tid, {close:true}, 'Kapatma istegi gonderildi');
+}
+function gonderPos(tid, body, mesaj){
+  fetch('/api/positions/'+tid,{method:'PATCH',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(function(r){return r.json().then(function(j){return {s:r.status,j:j}})})
+    .then(function(res){
+      var b=document.getElementById('pp-err-'+tid);
+      if(res.s===200&&res.j.ok){ if(b)b.style.display='none'; toast(mesaj); hidePos(tid); refresh(); }
+      else if(b){ b.innerHTML=(res.j.errors||['Gonderilemedi']).map(function(e){
+        return '&bull; '+esc(e)}).join('<br>'); b.style.display='block'; }
+    }).catch(function(){
+      var b=document.getElementById('pp-err-'+tid);
+      if(b){b.innerHTML='&bull; Baglanti hatasi';b.style.display='block';}
     });
 }
 
@@ -2062,6 +2216,27 @@ class Handler(BaseHTTPRequestHandler):
                                                         if k != "updated_at"))
             self._send(200 if ok else 500, json.dumps({"ok": ok}))
             return
+        # /api/positions/{trade_id} -> acik pozisyon yonetimi
+        if self.path.startswith("/api/positions/"):
+            tid = self._rule_id(self.path, "/api/positions/")
+            if not tid:
+                self._send(400, json.dumps({"ok": False, "errors": ["gecersiz id"]}))
+                return
+            d = self._body()
+            if d is None:
+                self._send(400, json.dumps({"ok": False, "errors": ["gecersiz istek"]}))
+                return
+            alanlar, errs = validate_position_req(d)
+            if errs:
+                self._send(400, json.dumps({"ok": False, "errors": errs}))
+                return
+            ok = sb_patch(f"bot_trades?id=eq.{tid}&closed_at=is.null", alanlar)
+            if ok:
+                log(f"Pozisyon #{tid} istegi: " +
+                    ", ".join(k for k in alanlar if k != "req_at"))
+            self._send(200 if ok else 500, json.dumps({"ok": ok}))
+            return
+
         # /api/rules/{id}/toggle  -> aktif/pasif
         if self.path.startswith("/api/rules/") and self.path.endswith("/toggle"):
             rid = self._rule_id(self.path[:-len("/toggle")], "/api/rules/")
