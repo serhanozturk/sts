@@ -702,6 +702,8 @@ body{
 .btn:hover{background:var(--surface2)}
 .btn-stop{border-color:var(--coralBd);background:var(--coralBg);color:var(--coral)}
 .btn-go{border-color:var(--greenBd);background:var(--greenBg);color:var(--green)}
+@keyframes donus{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+.doner{animation:donus .6s linear infinite}
 .icon-btn{width:36px;height:36px;padding:0;display:grid;place-items:center;font-size:15px}
 
 /* ---------- tabs ---------- */
@@ -832,6 +834,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
   </div>
   <div class="hdr-r">
     <span id="ks-state" class="badge b-off" style="display:none">Kill-switch</span>
+    <button class="btn icon-btn" onclick="elleYenile(this)" id="refresh-btn" title="Yenile">&#8635;</button>
     <button class="btn icon-btn" onclick="toggleTheme()" id="theme-btn" title="Tema">&#9789;</button>
     <button id="ks-btn" class="btn btn-stop" onclick="toggleKs()">Durdur</button>
   </div>
@@ -2099,12 +2102,22 @@ function toggleKs(){
 }
 
 /* ---------- yenileme ---------- */
-function refresh(){
-  fetch('/api/state').then(function(r){return r.json()}).then(function(d){
+function elleYenile(btn){
+  btn.disabled=true;
+  btn.classList.add('doner');
+  refresh(function(){
+    setTimeout(function(){ btn.disabled=false; btn.classList.remove('doner'); }, 350);
+  });
+}
+
+function refresh(bitince){
+  fetch('/api/state',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
     state=d;render();
+    if(bitince)bitince();
   }).catch(function(){
     var h=document.getElementById('health');
     h.textContent='Panel hatasi';h.className='badge b-off';
+    if(bitince)bitince();
   });
 }
 Object.keys(S_MAP).forEach(function(id){
