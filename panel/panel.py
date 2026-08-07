@@ -1344,6 +1344,19 @@ function pctTxt(v,d){
   return (x<0?'':'+')+fmt(x,d===undefined?2:d)+'%';
 }
 function cls(v){var x=n(v); return x===null?'mut':(x>0?'up':(x<0?'dn':'mut'))}
+/* Supabase UTC saklar - tarayicinin yerel saatine (TR) cevir */
+function trZaman(iso, tarihli){
+  if(!iso)return '—';
+  var d=new Date(iso);
+  if(isNaN(d))return String(iso).replace('T',' ').slice(5,16);
+  var g=String(d.getDate()).padStart(2,'0');
+  var a=String(d.getMonth()+1).padStart(2,'0');
+  var s=String(d.getHours()).padStart(2,'0');
+  var dk=String(d.getMinutes()).padStart(2,'0');
+  var sn=String(d.getSeconds()).padStart(2,'0');
+  return tarihli ? (g+'-'+a+' '+s+':'+dk+':'+sn) : (g+'-'+a+' '+s+':'+dk);
+}
+
 function esc(s){var d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML}
 function uretJson(){
   var out=document.getElementById('g-out');
@@ -1453,8 +1466,8 @@ function render(){
         +'<span class="badge '+(p.source==='rule'?'b-rule':'b-sig')+'">'+(p.source==='rule'?'Kural':'Sinyal')+'</span></div>'
         +'<div class="pos-dt mono"><span>Giris</span> '+fmt(p.entry,6)
         +' &nbsp;<span>Mark</span> <b id="mark-'+tid+'" style="font-weight:400">'+fmt(p.mark,6)+'</b>'
-        +' &nbsp;<span>TP</span> '+fmt(p.tp,6)+emirRozet(p.tp_order_var)
-        +' &nbsp;<span>SL</span> '+fmt(p.sl,6)+emirRozet(p.sl_order_var)
+        +' &nbsp;<span>TP</span> '+fmt(p.tp,6)
+        +' &nbsp;<span>SL</span> '+fmt(p.sl,6)
         +' &nbsp;<span>'+(p.leverage||'—')+'x</span>'
         +(m?' &nbsp;<span>'+usd(m,0)+'</span>':'')
         +'</div></div>'
@@ -1495,7 +1508,7 @@ function render(){
       +'<td class="mono '+cls(p)+'"><b>'+(p===null?'—':sgn(p))+'</b>'
         +(pct!==null?'<br><span style="font-size:10px">'+pctTxt(pct)+'</span>':'')+'</td>'
       +'<td>'+esc(t.exit_reason||'—')+'</td>'
-      +'<td class="mut mono">'+esc((t.opened_at||'').replace('T',' ').slice(5,16))+'</td></tr>';
+      +'<td class="mut mono">'+esc(trZaman(t.opened_at))+'</td></tr>';
   }).join(''):'<tr><td colspan="8" class="empty">Islem yok</td></tr>';
 
   var wb=document.querySelector('#webhooks tbody');
@@ -1507,7 +1520,7 @@ function render(){
     else if((w.result||'').indexOf('SKIPPED')===0){d='<span class="badge b-sig">Atlandi</span>';}
     else {d='<span class="badge b-off">Hata</span>';}
     return '<tr><td class="mut">'+w.id+'</td>'
-      +'<td class="mut mono">'+esc((w.created_at||'').replace('T',' ').slice(5,19))+'</td>'
+      +'<td class="mut mono">'+esc(trZaman(w.created_at,true))+'</td>'
       +'<td><b>'+esc(w.coin)+'</b></td>'
       +'<td><span class="badge '+(w.direction==='LONG'?'b-long':'b-short')+'">'+esc(w.direction)+'</span></td>'
       +'<td>'+d+'</td>'
@@ -1517,7 +1530,7 @@ function render(){
   var eb=document.querySelector('#events tbody');
   var evs=state.events||[];
   eb.innerHTML=evs.length?evs.map(function(e){
-    return '<tr><td class="mut mono">'+esc((e.ts||'').replace('T',' ').slice(5,19))+'</td>'
+    return '<tr><td class="mut mono">'+esc(trZaman(e.ts,true))+'</td>'
       +'<td>'+esc(e.kind)+'</td><td><b>'+esc(e.coin||'—')+'</b></td>'
       +'<td style="white-space:normal">'+esc(e.detail||'')+'</td></tr>';
   }).join(''):'<tr><td colspan="4" class="empty">Olay yok</td></tr>';
@@ -1661,12 +1674,6 @@ function importJson(){
 }
 
 /* ---------- acik pozisyon yonetimi ---------- */
-function emirRozet(v){
-  if(v===true)return '';                                  // emir yerinde - sessiz
-  if(v===false)return ' <span class="badge b-off" title="Bu emir borsada YOK">emir yok</span>';
-  return '';                                              // null: okunamadi
-}
-
 function posPanel(p,tid){
   return '<div id="pp-'+tid+'" class="pospanel" style="display:none">'
     +'<div class="frow">'
@@ -1754,7 +1761,7 @@ function openPos(tid){
       var kotu=/KORUMASIZ|degistirilemedi|basarisiz|HATA|mantiksiz/i.test(t.req_result);
       sonEl.innerHTML='<div class="'+(kotu?'warnbox':'okbox')+'" style="display:block">'
         +'<b>Son istek:</b> '+esc(t.req_result)
-        +(t.req_at?' <span style="opacity:.7">('+esc(t.req_at.replace("T"," ").slice(5,16))+')</span>':'')
+        +(t.req_at?' <span style="opacity:.7">('+esc(trZaman(t.req_at,true))+')</span>':'')
         +'</div>';
     } else { sonEl.innerHTML=''; }
   }
