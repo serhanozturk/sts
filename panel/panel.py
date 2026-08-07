@@ -1218,13 +1218,47 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
         <button class="btn" onclick="kopyala('wh-url',this)">Kopyala</button>
       </div>
 
-      <label style="margin-top:12px">Alarm mesaji &#8212; SHORT</label>
+      <div style="border-top:1px solid var(--border);padding-top:12px;margin-top:14px">
+        <p class="sect" style="margin-bottom:4px">Mesaj olusturucu</p>
+        <p style="font-size:11px;color:var(--text3);margin-bottom:10px">
+          Alarma ozel degerler gir, uretilen JSON'u TradingView Message kutusuna yapistir.
+          Bos biraktigin alanlar yukaridaki varsayilanlardan alinir.
+        </p>
+        <div class="frow">
+          <div><label>Coin</label><input id="g-coin" placeholder="{{ticker}}" oninput="uretJson()"></div>
+          <div><label>Yon</label><select id="g-dir" onchange="uretJson()">
+            <option value="SHORT">Short</option><option value="LONG">Long</option>
+          </select></div>
+        </div>
+        <div class="frow">
+          <div><label>TP tipi</label><select id="g-tptype" onchange="uretJson()">
+            <option value="">Varsayilan</option><option value="pct">Yuzde</option><option value="price">Fiyat</option>
+          </select></div>
+          <div><label>TP degeri</label><input id="g-tpval" placeholder="bos = varsayilan" oninput="uretJson()"></div>
+          <div><label>SL tipi</label><select id="g-sltype" onchange="uretJson()">
+            <option value="">Varsayilan</option><option value="pct">Yuzde</option><option value="price">Fiyat</option>
+          </select></div>
+          <div><label>SL degeri</label><input id="g-slval" placeholder="bos = varsayilan" oninput="uretJson()"></div>
+        </div>
+        <div class="frow">
+          <div><label>Teminat</label><div class="cunit"><input id="g-margin" placeholder="bos = varsayilan" style="padding-left:22px" oninput="uretJson()"><span class="u" style="left:10px;right:auto">$</span></div></div>
+          <div><label>Kaldirac</label><div class="cunit"><input id="g-lev" placeholder="bos = varsayilan" oninput="uretJson()"><span class="u">x</span></div></div>
+          <div><label>Not</label><input id="g-note" placeholder="opsiyonel" oninput="uretJson()"></div>
+        </div>
+        <label style="margin-top:8px">Uretilen mesaj</label>
+        <div class="cprow">
+          <textarea id="g-out" rows="3" readonly class="mono"></textarea>
+          <button class="btn btn-go" onclick="kopyala('g-out',this)">Kopyala</button>
+        </div>
+      </div>
+
+      <label style="margin-top:14px">Hazir mesaj &#8212; SHORT</label>
       <div class="cprow">
         <textarea id="wh-msg-short" rows="2" readonly class="mono"></textarea>
         <button class="btn" onclick="kopyala('wh-msg-short',this)">Kopyala</button>
       </div>
 
-      <label style="margin-top:10px">Alarm mesaji &#8212; LONG</label>
+      <label style="margin-top:10px">Hazir mesaj &#8212; LONG</label>
       <div class="cprow">
         <textarea id="wh-msg-long" rows="2" readonly class="mono"></textarea>
         <button class="btn" onclick="kopyala('wh-msg-long',this)">Kopyala</button>
@@ -1309,6 +1343,36 @@ function pctTxt(v,d){
 }
 function cls(v){var x=n(v); return x===null?'mut':(x>0?'up':(x<0?'dn':'mut'))}
 function esc(s){var d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML}
+function uretJson(){
+  var out=document.getElementById('g-out');
+  if(!out)return;
+  var tok=(state&&state.webhook_token)||'<WEBHOOK_TOKEN tanimli degil>';
+  function v(id){ var el=document.getElementById(id); return el?el.value.trim():''; }
+
+  var o={token:tok, coin:(v('g-coin')||'{{ticker}}'), direction:v('g-dir')||'SHORT'};
+
+  var tpt=v('g-tptype'), tpv=v('g-tpval');
+  if(tpv!==''){ o.tp_type = tpt||'pct'; o.tp_value = Number(tpv); }
+  else if(tpt!==''){ o.tp_type = tpt; }
+
+  var slt=v('g-sltype'), slv=v('g-slval');
+  if(slv!==''){ o.sl_type = slt||'pct'; o.sl_value = Number(slv); }
+  else if(slt!==''){ o.sl_type = slt; }
+
+  var m=v('g-margin'); if(m!=='') o.margin_usdt = Number(m);
+  var l=v('g-lev');    if(l!=='') o.leverage    = Number(l);
+  var nt=v('g-note');  if(nt!=='') o.note       = nt;
+
+  // sayi alanlarinda hatali giris varsa uyar
+  var hatali=[];
+  ['tp_value','sl_value','margin_usdt','leverage'].forEach(function(k){
+    if(k in o && (isNaN(o[k])||o[k]<=0)) hatali.push(k);
+  });
+  out.value = hatali.length
+    ? 'Gecersiz deger: '+hatali.join(', ')+' (sadece sayi gir)'
+    : JSON.stringify(o);
+}
+
 function kopyala(id,btn){
   var el=document.getElementById(id);
   var eski=btn.textContent;
@@ -1515,6 +1579,7 @@ function fillSettings(){
     '{"token":"'+tok+'","coin":"{{ticker}}","direction":"SHORT"}';
   document.getElementById('wh-msg-long').value=
     '{"token":"'+tok+'","coin":"{{ticker}}","direction":"LONG"}';
+  uretJson();
   settingsDirty=false;
   document.getElementById('s-errors').style.display='none';
 }
