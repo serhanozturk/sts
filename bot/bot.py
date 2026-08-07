@@ -121,6 +121,7 @@ CFG = {
 }
 SETTINGS_POLL_SEC = _env_i("BOT_SETTINGS_POLL_SEC", 30)
 WEBHOOK_POLL_SEC  = _env_i("BOT_WEBHOOK_POLL_SEC", 5)   # kuyruk kontrol araligi
+SOFT_EXIT         = _env_b("BOT_SOFT_EXIT", "true")     # bot tarafi TP/SL izleme
 
 # Webhook varsayilanlari (payload'da belirtilmeyen alanlar icin).
 # sts_settings'ten wh_* kolonlariyla ustune yazilir.
@@ -183,6 +184,12 @@ def tg_send(text):
 # ======================================================================
 # SUPABASE
 # ======================================================================
+
+def iso_url(dt):
+    """PostgREST URL'i icin ISO tarih. '+00:00' iceren tarihte '+' URL'de
+    bosluga donusur ve sorgu 400 verir; 'Z' formati guvenlidir."""
+    return dt.isoformat().replace("+00:00", "Z")
+
 
 def sb_request(method, path, body=None):
     if not SUPABASE_ON:
@@ -261,10 +268,12 @@ def sb_max_signal_id():
 
 
 def sb_recent_trade_coins(days):
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    """Son N gunde islem acilan sinyal coinleri.
+    Doner: set | None. None = SORGU BASARISIZ (cagiran sinyali ATLAMALI)."""
+    since = iso_url(datetime.now(timezone.utc) - timedelta(days=days))
     rows = sb_request("GET", f"bot_trades?select=coin&opened_at=gte.{since}&source=eq.signal")
-    if not rows:
-        return set()
+    if rows is None:
+        return None                       # hata: koruma kapanmasin
     return {r.get("coin") for r in rows if r.get("coin")}
 
 
@@ -312,12 +321,12 @@ def sb_recent_webhook_coins(seconds):
     """Son N saniyede ISLENMIS webhook coinleri (tekrar korumasi)."""
     if seconds <= 0:
         return set()
-    since = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+    since = iso_url(datetime.now(timezone.utc) - timedelta(seconds=seconds))
     rows = sb_request(
         "GET", f"sts_webhooks?select=coin&executed=is.true&executed_at=gte.{since}"
                f"&result=like.OPENED*")
-    if not rows:
-        return set()
+    if rows is None:
+        return None                       # hata: koruma kapanmasin
     return {r.get("coin") for r in rows if r.get("coin")}
 
 
@@ -1056,7 +1065,8 @@ class Bot:
         log(f"STS EXECUTOR {VERSION} basladi | mod={mode} | "
             f"sinyal: ${CFG['margin_usdt']} x{CFG['leverage']} {CFG['margin_mode']} "
             f"TP-{CFG['tp_pct']}% SL+{CFG['sl_pct']}% max={CFG['max_positions']} | "
-            f"kural havuzu max={CFG['max_rule_positions']}")
+            f"kural havuzu max={CFG['max_rule_positions']} | "
+            f"yumusak TP/SL={'acik' if SOFT_EXIT else 'kapali'}")
         tg_send(f"<b>STS basladi</b> ({mode})\n"
                 f"Sinyal: ${CFG['margin_usdt']} x{CFG['leverage']} | "
                 f"TP -{CFG['tp_pct']}% SL +{CFG['sl_pct']}% | max {CFG['max_positions']}\n"
@@ -1070,6 +1080,7 @@ class Bot:
                 live = self.check_closed_positions()
                 self.write_status(live)
                 self.process_position_requests(live)
+                self.monitor_soft_exits(live)
                 self.monitor_dynamic_exits(live)
                 self.refresh_rules()
                 if self.stopped():
@@ -1518,6 +1529,99 @@ class Bot:
         tg_send(f"<b>PANELDEN KAPATILDI</b> {coin} {side}\nCikis: {cikis}\nPnL: <b>{pnl_txt}</b>")
 
     # ------------------------------------------------------------------
+    # YUMUSAK TP/SL (bot tarafi izleme)
+    # ------------------------------------------------------------------
+    def monitor_soft_exits(self, live):
+        """Hard TP/SL emirleri borsada tetiklenmezse (demo ortaminda tetiklenmiyor)
+        bot kendisi kapatir. Canlida hard emir once tetiklenir; bu katman yedektir.
+        AND modundaki dinamik blok varsa o taraf ATLANIR - orada seviyeye ulasmak
+        tek basina yeterli degil, dinamik kosul da saglanmali."""
+        if not SOFT_EXIT or live is None or not self.open_trades:
+            return
+        for sym in list(self.open_trades.keys()):
+            if sym not in live:
+                continue
+            trade = self.open_trades[sym]
+            try:
+                self._check_soft(sym, trade, live[sym])
+            except Exception as e:
+                log(f"{trade.get('coin', sym)} yumusak cikis hatasi: {e}", "ERROR")
+
+    @staticmethod
+    def _and_modunda(trade, anahtar):
+        d = trade.get(anahtar)
+        if isinstance(d, str):
+            try:
+                d = json.loads(d)
+            except Exception:
+                d = None
+        return bool(d and d.get("active") and (d.get("mode") or "OR").upper() == "AND")
+
+    def _check_soft(self, symbol, trade, pos):
+        side = (trade.get("side") or "SHORT").upper()
+        fiyat = pos.get("markPrice")
+        try:
+            fiyat = float(fiyat) if fiyat else None
+        except (TypeError, ValueError):
+            fiyat = None
+        if not fiyat:
+            fiyat = self.ex.last_price(symbol)
+        if not fiyat:
+            return
+
+        tp = trade.get("tp_price")
+        sl = trade.get("sl_price")
+        vur = None
+
+        if tp and not self._and_modunda(trade, "dyn_tp"):
+            tp = float(tp)
+            if (side == "SHORT" and fiyat <= tp) or (side == "LONG" and fiyat >= tp):
+                vur = ("TP_SOFT", tp)
+        if vur is None and sl and not self._and_modunda(trade, "dyn_sl"):
+            sl = float(sl)
+            if (side == "SHORT" and fiyat >= sl) or (side == "LONG" and fiyat <= sl):
+                vur = ("SL_SOFT", sl)
+        if vur is None:
+            return
+
+        sebep, seviye = vur
+        coin = trade.get("coin", symbol)
+        amount = float(pos.get("contracts") or trade.get("amount") or 0)
+        if amount <= 0:
+            return
+
+        log(f"{sebep} {coin}: fiyat {fiyat} seviyeyi ({seviye}) gecti - kapatiliyor")
+        self.ex.cancel_all(symbol)
+        res = self.ex.close_market(symbol, side, amount)
+        if not res:
+            log(f"{coin} {sebep} kapatma BASARISIZ", "ERROR")
+            sb_log_event("ERROR", coin, f"{sebep} kapatma basarisiz (fiyat {fiyat})")
+            return
+
+        cikis = None
+        try:
+            cikis = res.get("average") or res.get("price")
+        except Exception:
+            pass
+        if not cikis:
+            cikis = self.ex.last_price(symbol) or fiyat
+
+        entry = float(trade.get("entry_price") or 0)
+        pnl = None
+        if entry and cikis:
+            pnl = round((entry - float(cikis)) * amount, 4) if side == "SHORT" \
+                else round((float(cikis) - entry) * amount, 4)
+
+        if trade.get("id"):
+            sb_close_trade(trade["id"], cikis, pnl, sebep)
+        self.open_trades.pop(symbol, None)
+
+        pnl_txt = f"{pnl:+.2f} USDT" if pnl is not None else "?"
+        sb_log_event("CLOSE", coin, f"{side} {sebep} seviye={seviye} cikis={cikis} pnl={pnl}")
+        tg_send(f"<b>{sebep}</b> {coin} {side}\nSeviye: {seviye}\nCikis: {cikis}\n"
+                f"PnL: <b>{pnl_txt}</b>")
+
+    # ------------------------------------------------------------------
     # DINAMIK CIKIS
     # ------------------------------------------------------------------
     def monitor_dynamic_exits(self, live):
@@ -1692,6 +1796,10 @@ class Bot:
             return
 
         recent = sb_recent_trade_coins(CFG["dedup_days"])
+        if recent is None:
+            log(f"{coin} atlandi - dedup sorgusu basarisiz (guvenli taraf)", "WARN")
+            sb_log_event("SIGNAL_SKIP", coin, "dedup sorgusu basarisiz - sinyal atlandi")
+            return
         if coin in recent:
             log(f"{coin} atlandi - son {CFG['dedup_days']} gun icinde islem gordu")
             sb_log_event("SIGNAL_SKIP", coin, f"dedup ({CFG['dedup_days']} gun)")
@@ -1936,9 +2044,15 @@ class Bot:
 
         # kisa sureli tekrar korumasi
         dedup = int(WH.get("dedup_sec") or 0)
-        if dedup > 0 and coin in sb_recent_webhook_coins(dedup):
-            sb_log_event("SIGNAL_SKIP", coin, f"webhook #{wid}: son {dedup} sn icinde islendi")
-            return f"SKIPPED:tekrar ({dedup}sn)"
+        if dedup > 0:
+            son = sb_recent_webhook_coins(dedup)
+            if son is None:
+                sb_log_event("SIGNAL_SKIP", coin, f"webhook #{wid}: dedup sorgusu basarisiz")
+                return "SKIPPED:dedup sorgusu basarisiz"
+            if coin in son:
+                sb_log_event("SIGNAL_SKIP", coin,
+                             f"webhook #{wid}: son {dedup} sn icinde islendi")
+                return f"SKIPPED:tekrar ({dedup}sn)"
 
         # parametreler: payload > Ayarlar varsayilanlari
         margin = float(num(payload.get("margin_usdt"), WH["margin_usdt"]) or WH["margin_usdt"])
