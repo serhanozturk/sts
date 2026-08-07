@@ -738,17 +738,19 @@ class Exchange:
             return False
 
     def place_single(self, symbol, pos_side, kind, stop_price):
-        """Tek koruma emri gonder. kind: 'TP' | 'SL'. Doner: (id, kesin_fiyat)."""
+        """Tek koruma emri gonder. kind: 'TP' | 'SL'.
+        Doner: (id, kesin_fiyat, hata_mesaji)."""
         close_side = "buy" if pos_side == "SHORT" else "sell"
         tip = "TAKE_PROFIT_MARKET" if kind == "TP" else "STOP_MARKET"
         fiyat = float(self.ex.price_to_precision(symbol, stop_price))
         try:
             o = self.ex.create_order(symbol, tip, close_side, None, None,
                                      {"stopPrice": fiyat, "closePosition": True})
-            return o.get("id"), fiyat
+            return o.get("id"), fiyat, None
         except Exception as e:
-            log(f"{symbol} {kind} emri kurulamadi: {e}", "ERROR")
-            return None, fiyat
+            mesaj = str(e)
+            log(f"{symbol} {kind} emri kurulamadi: {mesaj}", "ERROR")
+            return None, fiyat, mesaj
 
     def cancel_all(self, symbol):
         try:
@@ -1250,18 +1252,45 @@ class Bot:
         and_modu = bool(dyn and dyn.get("active") and
                         (dyn.get("mode") or "OR").upper() == "AND")
 
+        alan_fiyat_eski = trade.get("tp_price" if kind == "TP" else "sl_price")
+
         yeni_id = None
         if and_modu:
             kesin = float(self.ex.ex.price_to_precision(symbol, yeni_fiyat))
         else:
+            # Binance ayni tipte ikinci closePosition emrini kabul etmeyebilir:
+            # once eskiyi iptal et, kurulamazsa ESKI SEVIYEYI GERI KUR.
             self.ex.cancel_order(eski_id, symbol)
-            yeni_id, kesin = self.ex.place_single(symbol, side, kind, yeni_fiyat)
+            yeni_id, kesin, hata = self.ex.place_single(symbol, side, kind, yeni_fiyat)
             if yeni_id is None:
-                mesaj = f"{kind} emri kurulamadi"
-                sb_update_trade(trade["id"], {f"req_{kind.lower()}_price": None,
-                                              "req_result": mesaj})
-                tg_send(f"<b>UYARI</b> {coin}\n{kind} degistirilemedi, "
-                        f"eski emir iptal edildi. Elle kontrol et.")
+                geri_id = None
+                if alan_fiyat_eski:
+                    geri_id, _, _ = self.ex.place_single(symbol, side, kind,
+                                                         float(alan_fiyat_eski))
+                if geri_id:
+                    mesaj = f"{kind} degistirilemedi: {hata}"[:200]
+                    log(f"{coin} {kind} degistirilemedi, eski seviye geri kuruldu "
+                        f"({alan_fiyat_eski})", "WARN")
+                    sb_update_trade(trade["id"], {
+                        f"req_{kind.lower()}_price": None,
+                        (("tp_order_id") if kind == "TP" else "sl_order_id"): str(geri_id),
+                        "req_at": datetime.now(timezone.utc).isoformat(),
+                        "req_result": mesaj})
+                    sb_log_event("LEVEL_FAIL", coin, mesaj)
+                    tg_send(f"<b>{kind} DEGISTIRILEMEDI</b> {coin}\n{hata}\n"
+                            f"Eski seviye ({alan_fiyat_eski}) geri kuruldu.")
+                else:
+                    mesaj = f"{kind} KORUMASIZ: {hata}"[:200]
+                    log(f"{coin} {kind} emri yok - POZISYON KORUMASIZ!", "ERROR")
+                    sb_update_trade(trade["id"], {
+                        f"req_{kind.lower()}_price": None,
+                        (("tp_order_id") if kind == "TP" else "sl_order_id"): None,
+                        "req_at": datetime.now(timezone.utc).isoformat(),
+                        "req_result": mesaj})
+                    sb_log_event("ERROR", coin, mesaj)
+                    tg_send(f"<b>ACIL - {coin}</b>\n{kind} emri kurulamadi ve eski emir "
+                            f"geri getirilemedi. Pozisyon {kind} korumasi OLMADAN acik.\n"
+                            f"Hata: {hata}\nElle mudahale et.")
                 return
 
         alan_fiyat = "tp_price" if kind == "TP" else "sl_price"
