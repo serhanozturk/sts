@@ -1453,8 +1453,8 @@ function render(){
         +'<span class="badge '+(p.source==='rule'?'b-rule':'b-sig')+'">'+(p.source==='rule'?'Kural':'Sinyal')+'</span></div>'
         +'<div class="pos-dt mono"><span>Giris</span> '+fmt(p.entry,6)
         +' &nbsp;<span>Mark</span> <b id="mark-'+tid+'" style="font-weight:400">'+fmt(p.mark,6)+'</b>'
-        +' &nbsp;<span>TP</span> '+fmt(p.tp,6)
-        +' &nbsp;<span>SL</span> '+fmt(p.sl,6)
+        +' &nbsp;<span>TP</span> '+fmt(p.tp,6)+emirRozet(p.tp_order_var)
+        +' &nbsp;<span>SL</span> '+fmt(p.sl,6)+emirRozet(p.sl_order_var)
         +' &nbsp;<span>'+(p.leverage||'—')+'x</span>'
         +(m?' &nbsp;<span>'+usd(m,0)+'</span>':'')
         +'</div></div>'
@@ -1661,6 +1661,12 @@ function importJson(){
 }
 
 /* ---------- acik pozisyon yonetimi ---------- */
+function emirRozet(v){
+  if(v===true)return '';                                  // emir yerinde - sessiz
+  if(v===false)return ' <span class="badge b-off" title="Bu emir borsada YOK">emir yok</span>';
+  return '';                                              // null: okunamadi
+}
+
 function posPanel(p,tid){
   return '<div id="pp-'+tid+'" class="pospanel" style="display:none">'
     +'<div class="frow">'
