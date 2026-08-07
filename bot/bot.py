@@ -807,10 +807,18 @@ class Exchange:
             return None, fiyat, mesaj
 
     def cancel_all(self, symbol):
+        """SADECE verilen sembolun emirlerini iptal eder.
+        GUVENLIK: sembol bos ise hicbir sey yapmaz - aksi halde ccxt
+        hesaptaki TUM acik emirleri iptal edebilir."""
+        if not symbol:
+            log("cancel_all sembolsuz cagrildi - ISLEM YAPILMADI", "ERROR")
+            return False
         try:
             self.ex.cancel_all_orders(symbol)
+            return True
         except Exception as e:
             log(f"{symbol} emir iptali: {e}", "WARN")
+            return False
 
 
 # ======================================================================
@@ -1104,10 +1112,6 @@ class Bot:
         positions = []
         for sym, p in live.items():
             t = self.open_trades.get(sym) or {}
-            # koruma emirleri BORSADA gercekten duruyor mu (kayda guvenme)
-            gruplar = self.ex.protective_orders(sym)
-            tp_var = None if gruplar is None else len(gruplar.get("TP", [])) > 0
-            sl_var = None if gruplar is None else len(gruplar.get("SL", [])) > 0
             positions.append({
                 "symbol": sym,
                 "trade_id": t.get("id"),
@@ -1120,8 +1124,6 @@ class Bot:
                 "upnl": p.get("unrealizedPnl"),
                 "tp": t.get("tp_price"),
                 "sl": t.get("sl_price"),
-                "tp_order_var": tp_var,
-                "sl_order_var": sl_var,
                 "leverage": t.get("leverage"),
                 "margin": t.get("margin_usdt"),
             })
@@ -1268,10 +1270,10 @@ class Bot:
                 if trade.get("req_close"):
                     self._req_close(sym, trade, live[sym])
                     continue
-                if trade.get("req_tp_price") is not None:
-                    self._req_level(sym, trade, "TP", float(trade["req_tp_price"]))
-                if trade.get("req_sl_price") is not None:
-                    self._req_level(sym, trade, "SL", float(trade["req_sl_price"]))
+                istek_tp = trade.get("req_tp_price")
+                istek_sl = trade.get("req_sl_price")
+                if istek_tp is not None or istek_sl is not None:
+                    self._apply_levels(sym, trade, istek_tp, istek_sl)
             except Exception as e:
                 coin = trade.get("coin", sym)
                 log(f"{coin} pozisyon istegi hatasi: {e}", "ERROR")
@@ -1280,7 +1282,103 @@ class Bot:
                         "req_tp_price": None, "req_sl_price": None,
                         "req_close": False, "req_result": f"HATA: {e}"[:200]})
 
-    def _req_level(self, symbol, trade, kind, yeni_fiyat):
+    def _apply_levels(self, symbol, trade, yeni_tp=None, yeni_sl=None):
+        """TP ve/veya SL seviyesini degistir.
+        Binance ayni yonde ikinci closePosition emrini reddettigi icin (-4130),
+        o SEMBOLUN emirleri topluca iptal edilip ikisi birden yeniden kurulur.
+        Iptal SADECE bu sembol icin yapilir - diger pozisyonlar etkilenmez."""
+        coin = trade.get("coin", symbol)
+        side = (trade.get("side") or "SHORT").upper()
+        entry = float(trade.get("entry_price") or 0)
+
+        hedef_tp = float(yeni_tp) if yeni_tp is not None else trade.get("tp_price")
+        hedef_sl = float(yeni_sl) if yeni_sl is not None else trade.get("sl_price")
+
+        hatalar = []
+        if entry:
+            if hedef_tp:
+                iyi = float(hedef_tp) < entry if side == "SHORT" else float(hedef_tp) > entry
+                if not iyi:
+                    hatalar.append(f"TP {hedef_tp} girise ({entry}) gore mantiksiz")
+            if hedef_sl:
+                iyi = float(hedef_sl) > entry if side == "SHORT" else float(hedef_sl) < entry
+                if not iyi:
+                    hatalar.append(f"SL {hedef_sl} girise ({entry}) gore mantiksiz")
+        if hatalar:
+            mesaj = "; ".join(hatalar)[:200]
+            log(f"{coin} seviye degisikligi reddedildi: {mesaj}", "WARN")
+            sb_update_trade(trade["id"], {
+                "req_tp_price": None, "req_sl_price": None,
+                "req_at": datetime.now(timezone.utc).isoformat(),
+                "req_result": mesaj})
+            sb_log_event("LEVEL_FAIL", coin, mesaj)
+            tg_send(f"<b>SEVIYE DEGISMEDI</b> {coin}\n{mesaj}")
+            return
+
+        def and_mi(anahtar):
+            d = trade.get(anahtar)
+            if isinstance(d, str):
+                try:
+                    d = json.loads(d)
+                except Exception:
+                    d = None
+            return bool(d and d.get("active") and (d.get("mode") or "OR").upper() == "AND")
+
+        tp_and, sl_and = and_mi("dyn_tp"), and_mi("dyn_sl")
+
+        # SADECE bu sembolun emirlerini iptal et
+        self.ex.cancel_all(symbol)
+        time.sleep(0.4)
+
+        yeni, sorun = {}, []
+        if hedef_tp:
+            if tp_and:
+                yeni["tp_price"] = float(self.ex.ex.price_to_precision(symbol, hedef_tp))
+                yeni["tp_order_id"] = None
+            else:
+                oid, kesin, hata = self.ex.place_single(symbol, side, "TP", hedef_tp)
+                yeni["tp_price"] = kesin
+                yeni["tp_order_id"] = str(oid) if oid else None
+                if not oid:
+                    sorun.append(f"TP: {hata}")
+        if hedef_sl:
+            if sl_and:
+                yeni["sl_price"] = float(self.ex.ex.price_to_precision(symbol, hedef_sl))
+                yeni["sl_order_id"] = None
+            else:
+                oid, kesin, hata = self.ex.place_single(symbol, side, "SL", hedef_sl)
+                yeni["sl_price"] = kesin
+                yeni["sl_order_id"] = str(oid) if oid else None
+                if not oid:
+                    sorun.append(f"SL: {hata}")
+
+        yeni["req_tp_price"] = None
+        yeni["req_sl_price"] = None
+        yeni["req_at"] = datetime.now(timezone.utc).isoformat()
+
+        if sorun:
+            mesaj = ("KORUMASIZ - " + "; ".join(sorun))[:200]
+            yeni["req_result"] = mesaj
+            log(f"{coin} {mesaj}", "ERROR")
+            sb_log_event("ERROR", coin, mesaj)
+            tg_send(f"<b>ACIL - {coin}</b>\nKoruma emri kurulamadi:\n" +
+                    "\n".join(sorun) + "\nPozisyon korumasiz olabilir, elle kontrol et.")
+        else:
+            parcalar = []
+            if yeni_tp is not None:
+                parcalar.append(f"TP -> {yeni.get('tp_price')}")
+            if yeni_sl is not None:
+                parcalar.append(f"SL -> {yeni.get('sl_price')}")
+            mesaj = ", ".join(parcalar) or "seviyeler yenilendi"
+            yeni["req_result"] = mesaj
+            log(f"{coin} {mesaj}")
+            sb_log_event("LEVEL_CHANGE", coin, mesaj)
+            tg_send(f"<b>SEVIYE GUNCELLENDI</b> {coin}\n{mesaj}")
+
+        sb_update_trade(trade["id"], yeni)
+        trade.update(yeni)
+
+    def _req_level_kullanilmiyor(self, symbol, trade, kind, yeni_fiyat):
         """Hard TP veya SL seviyesini degistir: eski emri iptal et, yenisini kur."""
         coin = trade.get("coin", symbol)
         side = (trade.get("side") or "SHORT").upper()
