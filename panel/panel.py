@@ -1598,13 +1598,13 @@ function posPanel(p,tid){
     +'</div>'
     +'<div class="dynbox" style="margin-top:8px">'
       +'<div class="dynhead">'
-        +'<label class="chk"><input type="checkbox" id="p'+tid+'tp-active" onchange="dynToggle(\'p'+tid+'tp\')"><span>Dinamik TP</span></label>'
+        +'<label class="chk"><input type="checkbox" id="p'+tid+'tp-active" onchange="dynToggle(\\'p'+tid+'tp\\')"><span>Dinamik TP</span></label>'
         +'<span class="dynhint">Bu pozisyona ozel</span></div>'
       +'<div id="p'+tid+'tp-body" style="display:none">'+dynBody('p'+tid+'tp')+'</div>'
     +'</div>'
     +'<div class="dynbox">'
       +'<div class="dynhead">'
-        +'<label class="chk"><input type="checkbox" id="p'+tid+'sl-active" onchange="dynToggle(\'p'+tid+'sl\')"><span>Dinamik SL</span></label>'
+        +'<label class="chk"><input type="checkbox" id="p'+tid+'sl-active" onchange="dynToggle(\\'p'+tid+'sl\\')"><span>Dinamik SL</span></label>'
         +'<span class="dynhint">Bu pozisyona ozel</span></div>'
       +'<div id="p'+tid+'sl-body" style="display:none">'+dynBody('p'+tid+'sl')+'</div>'
     +'</div>'
@@ -1624,7 +1624,7 @@ function dynBody(on){
       +'<option value="5m">5m</option><option value="15m">15m</option><option value="30m">30m</option>'
       +'<option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>'
     +'</select></div>'
-    +'<div><label>Hard ile iliski</label><select id="'+on+'-mode" onchange="dynModeWarn(\''+on+'\')">'
+    +'<div><label>Hard ile iliski</label><select id="'+on+'-mode" onchange="dynModeWarn(\\''+on+'\\')">'
       +'<option value="OR">VEYA - hangisi once gelirse</option>'
       +'<option value="AND">VE - ikisi birden gerekli</option></select></div>'
     +'<div><label>Kosul mantigi</label><select id="'+on+'-logic">'
@@ -1633,9 +1633,9 @@ function dynBody(on){
     +'</div>'
     +'<div id="'+on+'-conds"></div>'
     +'<button class="btn" style="font-size:11px;padding:6px 12px;margin-top:6px" '
-      +'onclick="addCond(\''+on+'-conds\')">+ Kosul ekle</button>'
+      +'onclick="addCond(\\''+on+'-conds\\')">+ Kosul ekle</button>'
     +'<div id="'+on+'-warn" class="warnbox" style="display:none">'
-      +'<b>VE modu uyarisi:</b> Bu modda hard seviye Binance\'e emir olarak GONDERILMEZ, '
+      +'<b>VE modu uyarisi:</b> Bu modda hard seviye Binance\\'e emir olarak GONDERILMEZ, '
       +'bot her iki kosulu birlikte izler. Bot durursa bu koruma da durur.</div>';
 }
 
@@ -1667,7 +1667,7 @@ function savePos(tid){
 }
 function closePos(tid){
   var t=(state.trades||[]).filter(function(x){return x.id===tid})[0]||{};
-  if(!confirm((t.coin||'Pozisyon')+' kapatilsin mi?\nBu islem geri alinamaz.'))return;
+  if(!confirm((t.coin||'Pozisyon')+' kapatilsin mi?\\nBu islem geri alinamaz.'))return;
   gonderPos(tid, {close:true}, 'Kapatma istegi gonderildi');
 }
 function gonderPos(tid, body, mesaj){
