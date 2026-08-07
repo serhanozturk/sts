@@ -726,6 +726,60 @@ class Exchange:
             log(f"{symbol} acil kapatma hatasi: {e}", "ERROR")
             return None
 
+    def open_orders(self, symbol):
+        """Semboldeki acik emirler. Hata olursa None."""
+        try:
+            return self.ex.fetch_open_orders(symbol)
+        except Exception as e:
+            log(f"{symbol} acik emirler okunamadi: {e}", "WARN")
+            return None
+
+    @staticmethod
+    def _order_kind(o):
+        """Emri TP / SL olarak siniflandir."""
+        tip = (o.get("type") or "").upper()
+        bilgi = o.get("info") or {}
+        ham = (bilgi.get("type") or bilgi.get("origType") or "").upper()
+        metin = tip + " " + ham
+        if "TAKE_PROFIT" in metin:
+            return "TP"
+        if "STOP" in metin:
+            return "SL"
+        return None
+
+    def protective_orders(self, symbol):
+        """Semboldeki koruma emirlerini tipe gore grupla: {'TP': [...], 'SL': [...]}
+        Hata olursa None."""
+        emirler = self.open_orders(symbol)
+        if emirler is None:
+            return None
+        out = {"TP": [], "SL": []}
+        for o in emirler:
+            k = self._order_kind(o)
+            if k:
+                out[k].append(o)
+        return out
+
+    def cancel_protective(self, symbol, kind):
+        """Belirtilen tipteki TUM koruma emirlerini iptal et ve dogrula.
+        Doner: (basarili_mi, mesaj)."""
+        gruplar = self.protective_orders(symbol)
+        if gruplar is None:
+            return False, "acik emirler okunamadi"
+        hedef = gruplar.get(kind, [])
+        if not hedef:
+            return True, "iptal edilecek emir yok"
+        for o in hedef:
+            self.cancel_order(o.get("id"), symbol)
+        time.sleep(0.4)                       # borsa tarafinda islenmesini bekle
+        kontrol = self.protective_orders(symbol)
+        if kontrol is None:
+            return False, "iptal dogrulanamadi"
+        kalan = len(kontrol.get(kind, []))
+        if kalan:
+            return False, f"{kalan} adet {kind} emri iptal edilemedi"
+        return True, f"{len(hedef)} adet {kind} emri iptal edildi"
+
     def cancel_order(self, order_id, symbol):
         if not order_id:
             return True
@@ -1050,6 +1104,10 @@ class Bot:
         positions = []
         for sym, p in live.items():
             t = self.open_trades.get(sym) or {}
+            # koruma emirleri BORSADA gercekten duruyor mu (kayda guvenme)
+            gruplar = self.ex.protective_orders(sym)
+            tp_var = None if gruplar is None else len(gruplar.get("TP", [])) > 0
+            sl_var = None if gruplar is None else len(gruplar.get("SL", [])) > 0
             positions.append({
                 "symbol": sym,
                 "trade_id": t.get("id"),
@@ -1062,6 +1120,8 @@ class Bot:
                 "upnl": p.get("unrealizedPnl"),
                 "tp": t.get("tp_price"),
                 "sl": t.get("sl_price"),
+                "tp_order_var": tp_var,
+                "sl_order_var": sl_var,
                 "leverage": t.get("leverage"),
                 "margin": t.get("margin_usdt"),
             })
@@ -1258,9 +1318,20 @@ class Bot:
         if and_modu:
             kesin = float(self.ex.ex.price_to_precision(symbol, yeni_fiyat))
         else:
-            # Binance ayni tipte ikinci closePosition emrini kabul etmeyebilir:
-            # once eskiyi iptal et, kurulamazsa ESKI SEVIYEYI GERI KUR.
-            self.ex.cancel_order(eski_id, symbol)
+            # Binance ayni yonde ikinci closePosition emrini REDDEDER (-4130).
+            # Kayittaki id yanlis olabilir; borsadan okuyup tipe gore iptal et.
+            iptal_ok, iptal_msg = self.ex.cancel_protective(symbol, kind)
+            if not iptal_ok:
+                mesaj = f"{kind} degistirilemedi: {iptal_msg}"[:200]
+                log(f"{coin} {mesaj} - mevcut emir korunuyor", "WARN")
+                sb_update_trade(trade["id"], {
+                    f"req_{kind.lower()}_price": None,
+                    "req_at": datetime.now(timezone.utc).isoformat(),
+                    "req_result": mesaj})
+                sb_log_event("LEVEL_FAIL", coin, mesaj)
+                tg_send(f"<b>{kind} DEGISTIRILEMEDI</b> {coin}\n{iptal_msg}\n"
+                        f"Mevcut emir korundu, pozisyon guvende.")
+                return
             yeni_id, kesin, hata = self.ex.place_single(symbol, side, kind, yeni_fiyat)
             if yeni_id is None:
                 geri_id = None
