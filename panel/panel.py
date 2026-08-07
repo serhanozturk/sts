@@ -1371,7 +1371,11 @@ function render(){
     (hasU&&marginSum>0)?pctTxt(upnl/marginSum*100)+' teminata gore':'Anlik';
 
   var box=document.getElementById('positions');
-  if(!pos.length){box.innerHTML='<div class="empty">Acik pozisyon yok</div>';}
+  // Yonet paneli acikken listeyi yeniden cizme - kullanici duzenleme yapiyor
+  if(acikPos){
+    guncellePnl(pos);
+  }
+  else if(!pos.length){box.innerHTML='<div class="empty">Acik pozisyon yok</div>';}
   else{
     box.innerHTML=pos.map(function(p){
       var u=n(p.upnl), m=n(p.margin);
@@ -1382,14 +1386,14 @@ function render(){
         +'<span class="badge '+(p.side==='LONG'?'b-long':'b-short')+'">'+esc(p.side||'')+'</span>'
         +'<span class="badge '+(p.source==='rule'?'b-rule':'b-sig')+'">'+(p.source==='rule'?'Kural':'Sinyal')+'</span></div>'
         +'<div class="pos-dt mono"><span>Giris</span> '+fmt(p.entry,6)
-        +' &nbsp;<span>Mark</span> '+fmt(p.mark,6)
+        +' &nbsp;<span>Mark</span> <b id="mark-'+tid+'" style="font-weight:400">'+fmt(p.mark,6)+'</b>'
         +' &nbsp;<span>TP</span> '+fmt(p.tp,6)
         +' &nbsp;<span>SL</span> '+fmt(p.sl,6)
         +' &nbsp;<span>'+(p.leverage||'—')+'x</span>'
         +(m?' &nbsp;<span>'+usd(m,0)+'</span>':'')
         +'</div></div>'
-        +'<div class="pos-r"><div class="pnl '+cls(u)+'">'+sgn(u)+'</div>'
-        +(pct!==null?'<div class="pnl-pct '+cls(pct)+'">'+pctTxt(pct)+'</div>':'')
+        +'<div class="pos-r"><div id="pnl-'+tid+'" class="pnl '+cls(u)+'">'+sgn(u)+'</div>'
+        +(pct!==null?'<div id="pnlp-'+tid+'" class="pnl-pct '+cls(pct)+'">'+pctTxt(pct)+'</div>':'')
         +(tid?'<button class="mini" style="margin:6px 0 0" onclick="openPos('+tid+')">Yonet</button>':'')
         +'</div></div>'
         +(tid?posPanel(p,tid):'');
@@ -1640,6 +1644,23 @@ function dynBody(on){
 }
 
 var acikPos=null;
+
+/* Yonet paneli acikken: kartlari yeniden kurmadan sadece PnL/mark tazele */
+function guncellePnl(pos){
+  pos.forEach(function(p){
+    var tid=p.trade_id;
+    if(!tid)return;
+    var u=n(p.upnl), m=n(p.margin);
+    var pct=(u!==null&&m)?u/m*100:null;
+    var el=document.getElementById('pnl-'+tid);
+    if(el){ el.textContent=sgn(u); el.className='pnl '+cls(u); }
+    var el2=document.getElementById('pnlp-'+tid);
+    if(el2&&pct!==null){ el2.textContent=pctTxt(pct); el2.className='pnl-pct '+cls(pct); }
+    var el3=document.getElementById('mark-'+tid);
+    if(el3){ el3.textContent=fmt(p.mark,6); }
+  });
+}
+
 function openPos(tid){
   if(acikPos&&acikPos!==tid)hidePos(acikPos);
   var el=document.getElementById('pp-'+tid);
