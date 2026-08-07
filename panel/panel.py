@@ -800,6 +800,8 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
 .chk{display:flex;align-items:center;gap:8px;cursor:pointer;margin:0}
 .chk input{width:16px;height:16px;accent-color:var(--green);cursor:pointer}
 .chk span{font-size:13px;font-weight:600;color:var(--text)}
+.okbox{background:var(--greenBg);border:1px solid var(--greenBd);border-radius:9px;
+  padding:10px 12px;margin-top:10px;font-size:11px;color:var(--green);line-height:1.5}
 .warnbox{background:var(--amberBg);border:1px solid var(--amber);border-radius:9px;
   padding:10px 12px;margin-top:10px;font-size:11px;color:var(--amber);line-height:1.5}
 .errbox{display:none;background:var(--coralBg);border:1px solid var(--coralBd);
@@ -1677,6 +1679,7 @@ function posPanel(p,tid){
         +'<span class="dynhint">Bu pozisyona ozel</span></div>'
       +'<div id="p'+tid+'sl-body" style="display:none">'+dynBody('p'+tid+'sl')+'</div>'
     +'</div>'
+    +'<div id="pp-son-'+tid+'"></div>'
     +'<div id="pp-err-'+tid+'" class="errbox"></div>'
     +'<div style="display:flex;justify-content:space-between;gap:8px;margin-top:10px;flex-wrap:wrap">'
       +'<button class="btn btn-stop" onclick="closePos('+tid+')">Pozisyonu kapat</button>'
@@ -1731,9 +1734,24 @@ function openPos(tid){
   var el=document.getElementById('pp-'+tid);
   if(!el)return;
   if(el.style.display!=='none'){hidePos(tid);return;}
+  var bekleyen=(state.trades||[]).filter(function(x){return x.id===tid})[0]||{};
+  if(bekleyen.req_tp_price!=null||bekleyen.req_sl_price!=null||bekleyen.req_close){
+    toast('Bu pozisyonda bekleyen bir istek var');
+  }
   el.style.display='block';
   acikPos=tid;
   var t=(state.trades||[]).filter(function(x){return x.id===tid})[0]||{};
+  // son istek sonucu (basarili/basarisiz) goster
+  var sonEl=document.getElementById('pp-son-'+tid);
+  if(sonEl){
+    if(t.req_result){
+      var kotu=/KORUMASIZ|degistirilemedi|basarisiz|HATA|mantiksiz/i.test(t.req_result);
+      sonEl.innerHTML='<div class="'+(kotu?'warnbox':'okbox')+'" style="display:block">'
+        +'<b>Son istek:</b> '+esc(t.req_result)
+        +(t.req_at?' <span style="opacity:.7">('+esc(t.req_at.replace("T"," ").slice(5,16))+')</span>':'')
+        +'</div>';
+    } else { sonEl.innerHTML=''; }
+  }
   LOGIC_OF['p'+tid+'tp-conds']='p'+tid+'tp-logic';
   LOGIC_OF['p'+tid+'sl-conds']='p'+tid+'sl-logic';
   dynFill('p'+tid+'tp', t.dyn_tp);
