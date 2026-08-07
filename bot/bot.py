@@ -273,6 +273,10 @@ def sb_open_trades():
     return rows if rows else []
 
 
+def sb_update_trade(trade_id, fields):
+    return sb_request("PATCH", f"bot_trades?id=eq.{trade_id}", fields)
+
+
 def sb_insert_trade(row):
     res = sb_request("POST", "bot_trades", row)
     if res and len(res) > 0:
@@ -722,6 +726,30 @@ class Exchange:
             log(f"{symbol} acil kapatma hatasi: {e}", "ERROR")
             return None
 
+    def cancel_order(self, order_id, symbol):
+        if not order_id:
+            return True
+        try:
+            self.ex.cancel_order(str(order_id), symbol)
+            return True
+        except Exception as e:
+            # zaten dolmus/iptal edilmis olabilir - engelleyici degil
+            log(f"{symbol} emir iptali ({order_id}): {e}", "WARN")
+            return False
+
+    def place_single(self, symbol, pos_side, kind, stop_price):
+        """Tek koruma emri gonder. kind: 'TP' | 'SL'. Doner: (id, kesin_fiyat)."""
+        close_side = "buy" if pos_side == "SHORT" else "sell"
+        tip = "TAKE_PROFIT_MARKET" if kind == "TP" else "STOP_MARKET"
+        fiyat = float(self.ex.price_to_precision(symbol, stop_price))
+        try:
+            o = self.ex.create_order(symbol, tip, close_side, None, None,
+                                     {"stopPrice": fiyat, "closePosition": True})
+            return o.get("id"), fiyat
+        except Exception as e:
+            log(f"{symbol} {kind} emri kurulamadi: {e}", "ERROR")
+            return None, fiyat
+
     def cancel_all(self, symbol):
         try:
             self.ex.cancel_all_orders(symbol)
@@ -977,6 +1005,7 @@ class Bot:
                 self.refresh_settings()
                 live = self.check_closed_positions()
                 self.write_status(live)
+                self.process_position_requests(live)
                 self.monitor_dynamic_exits(live)
                 self.refresh_rules()
                 if self.stopped():
@@ -1021,6 +1050,7 @@ class Bot:
             t = self.open_trades.get(sym) or {}
             positions.append({
                 "symbol": sym,
+                "trade_id": t.get("id"),
                 "coin": t.get("coin") or sym.split("/")[0],
                 "side": (p.get("side") or t.get("side") or "").upper(),
                 "source": t.get("source") or "signal",
@@ -1137,6 +1167,157 @@ class Bot:
             ctx["funding_pct"] = self.ex.funding_rate(symbol)
 
         return ctx
+
+    # ------------------------------------------------------------------
+    # ACIK POZISYON YONETIMI (panelden gelen istekler)
+    # ------------------------------------------------------------------
+    def refresh_open_trades(self, live):
+        """Acik kayitlari Supabase'den tazele: panel dinamik cikis veya
+        istek alanlarini degistirmis olabilir."""
+        rows = sb_open_trades()
+        if rows is None:
+            return []
+        guncel = []
+        for row in rows:
+            sym = row.get("symbol") or self.ex.unified(row.get("coin", ""))
+            if not sym:
+                continue
+            eski = self.open_trades.get(sym)
+            if eski:
+                # bellekteki kaydi tazele (id, order id'leri korunur)
+                eski.update({k: row.get(k) for k in
+                             ("dyn_tp", "dyn_sl", "tp_price", "sl_price",
+                              "tp_order_id", "sl_order_id",
+                              "req_tp_price", "req_sl_price", "req_close")})
+                guncel.append((sym, eski))
+            elif live is not None and sym in live:
+                self.open_trades[sym] = row
+                guncel.append((sym, row))
+        return guncel
+
+    def process_position_requests(self, live):
+        """Panelden gelen hard TP/SL degisikligi ve kapatma isteklerini uygula."""
+        if live is None:
+            return
+        for sym, trade in self.refresh_open_trades(live):
+            if sym not in live:
+                continue
+            try:
+                if trade.get("req_close"):
+                    self._req_close(sym, trade, live[sym])
+                    continue
+                if trade.get("req_tp_price") is not None:
+                    self._req_level(sym, trade, "TP", float(trade["req_tp_price"]))
+                if trade.get("req_sl_price") is not None:
+                    self._req_level(sym, trade, "SL", float(trade["req_sl_price"]))
+            except Exception as e:
+                coin = trade.get("coin", sym)
+                log(f"{coin} pozisyon istegi hatasi: {e}", "ERROR")
+                if trade.get("id"):
+                    sb_update_trade(trade["id"], {
+                        "req_tp_price": None, "req_sl_price": None,
+                        "req_close": False, "req_result": f"HATA: {e}"[:200]})
+
+    def _req_level(self, symbol, trade, kind, yeni_fiyat):
+        """Hard TP veya SL seviyesini degistir: eski emri iptal et, yenisini kur."""
+        coin = trade.get("coin", symbol)
+        side = (trade.get("side") or "SHORT").upper()
+        entry = float(trade.get("entry_price") or 0)
+
+        # mantik kontrolu
+        if entry:
+            if kind == "TP":
+                mantikli = yeni_fiyat < entry if side == "SHORT" else yeni_fiyat > entry
+            else:
+                mantikli = yeni_fiyat > entry if side == "SHORT" else yeni_fiyat < entry
+            if not mantikli:
+                mesaj = f"{kind} seviyesi girise gore mantiksiz (giris {entry})"
+                log(f"{coin} {mesaj}", "WARN")
+                sb_update_trade(trade["id"], {f"req_{kind.lower()}_price": None,
+                                              "req_result": mesaj[:200]})
+                return
+
+        alan = "tp_order_id" if kind == "TP" else "sl_order_id"
+        eski_id = trade.get(alan)
+
+        # AND modunda hard emir Binance'te YOK - sadece seviye guncellenir
+        dyn = trade.get("dyn_tp" if kind == "TP" else "dyn_sl")
+        if isinstance(dyn, str):
+            try:
+                dyn = json.loads(dyn)
+            except Exception:
+                dyn = None
+        and_modu = bool(dyn and dyn.get("active") and
+                        (dyn.get("mode") or "OR").upper() == "AND")
+
+        yeni_id = None
+        if and_modu:
+            kesin = float(self.ex.ex.price_to_precision(symbol, yeni_fiyat))
+        else:
+            self.ex.cancel_order(eski_id, symbol)
+            yeni_id, kesin = self.ex.place_single(symbol, side, kind, yeni_fiyat)
+            if yeni_id is None:
+                mesaj = f"{kind} emri kurulamadi"
+                sb_update_trade(trade["id"], {f"req_{kind.lower()}_price": None,
+                                              "req_result": mesaj})
+                tg_send(f"<b>UYARI</b> {coin}\n{kind} degistirilemedi, "
+                        f"eski emir iptal edildi. Elle kontrol et.")
+                return
+
+        alan_fiyat = "tp_price" if kind == "TP" else "sl_price"
+        sb_update_trade(trade["id"], {
+            alan_fiyat: kesin, alan: str(yeni_id) if yeni_id else None,
+            f"req_{kind.lower()}_price": None,
+            "req_at": datetime.now(timezone.utc).isoformat(),
+            "req_result": f"{kind} -> {kesin}",
+        })
+        trade[alan_fiyat] = kesin
+        trade[alan] = str(yeni_id) if yeni_id else None
+
+        log(f"{coin} {kind} guncellendi -> {kesin}" + (" (AND modu, emir yok)" if and_modu else ""))
+        sb_log_event("LEVEL_CHANGE", coin, f"{kind} -> {kesin}")
+        tg_send(f"<b>{kind} DEGISTI</b> {coin}\nYeni seviye: {kesin}")
+
+    def _req_close(self, symbol, trade, pos):
+        """Panelden elle kapatma istegi."""
+        coin = trade.get("coin", symbol)
+        side = (trade.get("side") or "SHORT").upper()
+        amount = float(pos.get("contracts") or trade.get("amount") or 0)
+        if amount <= 0:
+            sb_update_trade(trade["id"], {"req_close": False,
+                                          "req_result": "miktar okunamadi"})
+            return
+
+        self.ex.cancel_all(symbol)
+        res = self.ex.close_market(symbol, side, amount)
+        if not res:
+            sb_update_trade(trade["id"], {"req_close": False,
+                                          "req_result": "kapatma emri basarisiz"})
+            tg_send(f"<b>UYARI</b> {coin}\nElle kapatma basarisiz oldu.")
+            return
+
+        cikis = None
+        try:
+            cikis = res.get("average") or res.get("price")
+        except Exception:
+            pass
+        if not cikis:
+            cikis = self.ex.last_price(symbol)
+
+        entry = float(trade.get("entry_price") or 0)
+        pnl = None
+        if entry and cikis:
+            pnl = round((entry - float(cikis)) * amount, 4) if side == "SHORT" \
+                else round((float(cikis) - entry) * amount, 4)
+
+        sb_close_trade(trade["id"], cikis, pnl, "MANUEL_PANEL")
+        sb_update_trade(trade["id"], {"req_close": False, "req_result": "kapatildi"})
+        self.open_trades.pop(symbol, None)
+
+        pnl_txt = f"{pnl:+.2f} USDT" if pnl is not None else "?"
+        log(f"PANELDEN KAPATILDI {coin} {side} | cikis {cikis} | PnL {pnl_txt}")
+        sb_log_event("CLOSE", coin, f"{side} MANUEL_PANEL cikis={cikis} pnl={pnl}")
+        tg_send(f"<b>PANELDEN KAPATILDI</b> {coin} {side}\nCikis: {cikis}\nPnL: <b>{pnl_txt}</b>")
 
     # ------------------------------------------------------------------
     # DINAMIK CIKIS
