@@ -39,7 +39,18 @@ except ImportError:
     sys.stderr.write("HATA: ccxt kurulu degil.  pip install ccxt\n")
     sys.exit(1)
 
-VERSION = "v2"
+VERSION = "v3.0"
+# ---------------------------------------------------------------------------
+# SURUM GECMISI (her kod degisikliginde artir)
+#   v3.0  3 seviyeli kill-switch (RUN/PAUSE/STOP) + acil cikis, webhook ile
+#         pozisyon kapatma (action=close), degme kosullari (touch_price/
+#         touch_ema), kapanis sebebi fiyattan tespit, periyot buyuk/kucuk
+#         harf duyarsiz (1D/1W), status'a koruma emri bilgisi
+#   v2    yumusak TP/SL (TP_SOFT/SL_SOFT), dinamik TP/SL, dedup tarih
+#         duzeltmesi + fail-safe, max miktar kirpma, ayarlar Supabase'den,
+#         pozisyon yonetimi istekleri, TradingView webhook
+#   v1    sinyal havuzu + ozel kural motoru, hard TP/SL, kill-switch
+# ---------------------------------------------------------------------------
 
 # ======================================================================
 # .env DOSYASI (varsa yukle - harici kutuphane gerekmez)
@@ -152,7 +163,25 @@ TG_ON           = bool(TG_TOKEN and TG_CHAT_IDS)
 # --- Dosyalar ---
 STOP_FLAG       = _env("BOT_STOP_FLAG", "bot_stop.flag")   # yerel acil yedek
 
-TF_SECONDS = {"5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
+_TF_HAM = {"5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400,
+           "1d": 86400, "1w": 604800}
+
+
+class _TFSozluk(dict):
+    """Periyot eslemesi buyuk/kucuk harf duyarsiz.
+    Panel artik '1D' gonderiyor; veritabaninda '1d' olan eski kayitlar da calisir."""
+
+    def __getitem__(self, k):
+        return dict.__getitem__(self, str(k).lower())
+
+    def get(self, k, d=None):
+        return dict.get(self, str(k).lower(), d)
+
+    def __contains__(self, k):
+        return dict.__contains__(self, str(k).lower())
+
+
+TF_SECONDS = _TFSozluk(_TF_HAM)
 
 
 # ======================================================================
@@ -1259,6 +1288,9 @@ class Bot:
                 "upnl": p.get("unrealizedPnl"),
                 "tp": t.get("tp_price"),
                 "sl": t.get("sl_price"),
+                # Borsada koruma emri var mi (kayittaki id): panel uyari gosterir
+                "tp_order": bool(t.get("tp_order_id")),
+                "sl_order": bool(t.get("sl_order_id")),
                 "leverage": t.get("leverage"),
                 "margin": t.get("margin_usdt"),
             })
