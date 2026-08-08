@@ -25,6 +25,7 @@ def check(ad, kosul, detay=""):
 
 
 h = P.HTML
+P_KAYNAK = open("panel.py", encoding="utf-8").read()
 css = re.search(r"<style>(.*?)</style>", h, re.S).group(1)
 js = re.search(r"<script>(.*?)</script>", h, re.S).group(1)
 
@@ -164,6 +165,35 @@ cikti = (r2.stdout or "") + (r2.stderr or "")
 check("render() hatasiz", "OK1" in cikti, cikti[:300])
 check("fillSettings() hatasiz", "OK2" in cikti, cikti[:300])
 check("uretJson() hatasiz", "OK3" in cikti, cikti[:300])
+
+print("\n=== Periyot etiketleri ve koruma uyarisi ===")
+check("1D buyuk harf (8 secici)", h.count('value="1D">1D<') >= 8,
+      f"bulunan: {h.count(chr(39))}")
+check("1d kucuk harf kalmadi", 'value="1d">1d<' not in h)
+check("_tf_normal var", hasattr(P, "_tf_normal"))
+check("1D kabul + gorunum", P._tf_normal("1D") == "1D")
+check("eski 1d kayitlari calisir", P._tf_normal("1d") == "1D")
+check("1W destegi", P._tf_normal("1W") == "1W")
+check("gecersiz periyot None", P._tf_normal("3m") is None)
+check("kuralda 1D saklanir",
+      P.validate_rule({"coin": "HEI", "direction": "SHORT", "timeframe": "1d",
+                       "conditions": [{"type": "rsi", "op": ">", "p2": 70}],
+                       "tp_type": "pct", "tp_value": 10,
+                       "sl_type": "pct", "sl_value": 15})[0]["timeframe"] == "1D")
+check("korumaRozet fonksiyonu", "function korumaRozet(varMi,tur)" in h)
+check("koruma rozeti TP/SL'e bagli",
+      "korumaRozet(p.tp_order,'TP')" in h and "korumaRozet(p.sl_order,'SL')" in h)
+check("yonet panelinde uyari", "Koruma bot tarafinda." in h)
+check("uyari sadece emir yokken", "p.tp_order===false||p.sl_order===false" in h)
+check("JS dinamik tf normalize", "if(String(tfd).toLowerCase()==='1d')tfd='1D'" in h)
+
+print("\n=== Surum takibi ===")
+check("panel surumu v3.0", P.VERSION == "v3.0", P.VERSION)
+check("surum gecmisi yorumu var", "SURUM GECMISI" in P_KAYNAK)
+check("state'te panel surumu", '"panel_version": VERSION' in P_KAYNAK)
+check("baslikta surum rozeti", 'id="ver"' in h)
+check("uyusmazlik uyarisi", "SURUM UYUSMAZLIGI" in h)
+check("ayni surumde sade gosterim", "vr.textContent=pv;" in h)
 
 print("\n=== Backend saglam ===")
 check("validate_rule calisiyor",
