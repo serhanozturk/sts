@@ -187,7 +187,7 @@ Port mapping kaldirildi — `:8090` artik calismiyor.
 | Seviye | Ne olur | Kullanim |
 |---|---|---|
 | `RUN` | Normal calisma | — |
-| `PAUSE` | Yeni pozisyon yok. Izleme, yumusak/dinamik cikislar, panel istekleri DEVAM | Strateji supheli, mevcutlari tasiyorum |
+| `PAUSE` | Yeni pozisyon yok. Izleme, yumusak/dinamik cikislar, panel istekleri DEVAM. **Webhook TAMAMEN atlanir — `action=close` dahil** (bkz. Yapilacaklar 6) | Strateji supheli, mevcutlari tasiyorum |
 | `STOP` | **Her sey durur** (yumusak TP/SL, dinamik cikis, webhook, kural motoru). Hard TP/SL Binance'te kalir. Panelde kalici kirmizi bant: "Acik pozisyonlar izlenmiyor" | Bot hatali davraniyor, ben devraliyorum |
 
 **Acil cikis** bir seviye degil, bir eylemdir: `req_emergency=true` yazilir, executor
@@ -202,6 +202,13 @@ tutmak**. Demo'da hard emirler guvenilmez oldugu icin `STOP` gercekten korumasiz
 birakir — bu yuzden ayri bir seviye ve kalici uyari gerekli.
 
 Yerel `bot_stop.flag` dosyasi acil yedek olarak `PAUSE` etkisi yapar.
+
+**CANLI DOGRULANDI (2026-08-08, testnet, 5 acik pozisyon):** dort gecis de calisti —
+`RUN->PAUSE`, `PAUSE->RUN`, `RUN->STOP`, `STOP->RUN`. Hepsi `sts_events`'e `LEVEL`
+tipiyle yazildi. Algilama gecikmesi her yonde ~20 sn (`poll_seconds`). PAUSE'da izleme
+sürdü (status tazelenmeye devam etti), STOP'ta kalici kirmizi bant cikti ve executor
+**durum yazmayi surdurdu** (panel executor'u "sessiz" sanmasin diye — kritik).
+Ikisinde de acik pozisyonlara dokunulmadi. **Acil cikis henuz test edilmedi.**
 
 ---
 
@@ -341,10 +348,33 @@ Bes sekme: **Durum**, **Islemler**, **Olaylar**, **Kurallar**, **Ayarlar**
 3. 2-3 hafta testnet dogrulamasi
 4. Canliya gecerken pozisyon boyutunu $20-30 ile baslat
 5. Demo hard TP/SL kisiti — yumusak katman pratikte cozdu, test sonrasi karara baglanacak
+6. **PAUSE'da webhook ile kapatma calismiyor** (`bot.py`) — ana dongude PAUSE dalinda
+   `process_webhooks()` tamamen atlaniyor, icindeki `action=close` olanlar dahil.
+   PAUSE'un amaci "mevcutlari tasiyorum" oldugu icin TV cikis alarmi calismali.
+   Cozum: PAUSE'da `process_webhooks()` cagrilsin, icinde `action=close` OLMAYANLAR
+   atlansin. Elle kapatma ve yumusak SL PAUSE'da zaten calisiyor — tutarsizlik bu.
+7. **`confirm()` yerine panel ici onay kutusu** (`panel.py`) — native JS diyalogu
+   Chrome uzantisinda renderer'i kilitliyor (tiklama aninda CDP timeout), otomasyonla
+   test edilemiyor. Tema uyumlu kendi onay kutusu hem bunu cozer hem gorsel tutarlilik
+   saglar. Kill-switch, elle kapatma ve kural silme diyaloglarinin hepsi etkilenir.
 
 **Tamamlandi:** domain + HTTPS (`stspanel.com`, Let's Encrypt), 3 seviyeli kill-switch,
 webhook ile kapatma, degme kosullari, kapanis sebebi tespiti, dedup duzeltmesi,
 yumusak TP/SL, yenile butonu, fiyat formati, savePos duzeltmesi
+
+**v3.0 DEPLOY DOGRULAMASI TAMAM (2026-08-08):** panel ve executor ikisi de `v3.0`,
+surum rozeti tek numara. Canli kanitlar: degme kosulu (`RULE_TRIGGER` kural 5 TUT,
+`bar [0.06759-0.07099] ema7=0.0686415 degdi mi -> True`), `WEBHOOK_CLOSE` (BTCUSDT) ve
+ardindan pozisyon yokken dogru `SKIPPED`, `SL_SOFT` iki kapanis, savePos+yumusak katman
+zinciri (TUT: SL panelden degistirildi -> hard emir `-4130` -> `SL_SOFT` kapatti),
+kill-switch dort gecis (bkz. 8b). `_sebep_fiyattan()` birim testi 12/12 gecti ancak
+**prod'da henuz tetiklenmedi** — deploy sonrasi tum kapanislar zaten etiketli yolla
+(`SL_SOFT`/`WEBHOOK_CLOSE`) oldu, bu beklenen davranis.
+
+**Deploy oncesi 2 kayit yanlis etiketli:** TST id 16 (cikis 0.01368 / tp 0.01366, fark
+%0.15) ve id 17 (cikis 0.01249 / tp 0.0125, fark %0.08) — yeni mantik bunlari `TP`
+etiketlerdi, `MANUEL/BILINMIYOR` kaldi. Isabet orani istatistigini bozuyor; 2-3 haftalik
+testnet dogrulamasi oncesi elle UPDATE ile duzeltilmesi dusunuluyor (karar bekliyor).
 
 **Beklemede:** coklu kullanici (uc model tasarlandi: ayni hesap+roller / hesap basina
 ayri executor / sifreli DB — ikincisi onerilen), backtest motoru (ayri chat'te
