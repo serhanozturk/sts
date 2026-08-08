@@ -23,7 +23,18 @@ from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
-VERSION = "panel-v1"
+VERSION = "v3.0"
+# ---------------------------------------------------------------------------
+# SURUM GECMISI (her kod degisikliginde artir)
+#   v3.0  yeni tasarim (borsa temasi, DM Sans + JetBrains Mono, iki tema),
+#         3 seviyeli kill-switch arayuzu, webhook kapatma + mesaj olusturucu,
+#         degme kosullari, olay/durum rozetlerine renk, periyot 1D/1W buyuk
+#         harf, "koruma bot tarafinda" uyarisi, fiyat ondalik formati,
+#         savePos yalnizca degisen alani gonderir
+#   v2    Ayarlar sekmesi, JSON ile kural ekleme, dinamik TP/SL bloklari,
+#         acik pozisyon yonetimi (Yonet), webhook karti, yenile butonu
+#   v1    5 sekme, kural CRUD, kill-switch, gece/gunduz temasi
+# ---------------------------------------------------------------------------
 
 # ======================================================================
 # .env
@@ -190,7 +201,16 @@ def sb_delete(path):
 COND_TYPES = {"ema_cross", "rsi", "price", "oi_change", "volume", "funding",
               "touch_price", "touch_ema"}
 OPS = {"<", ">", "<=", ">=", "="}
-TIMEFRAMES = {"5m", "15m", "30m", "1h", "4h", "1d"}
+# Periyot: panel "1D" gonderir, eski kayitlarda "1d" olabilir -> kucuk harfle karsilastir
+TIMEFRAMES = {"5m", "15m", "30m", "1h", "4h", "1d", "1w"}
+
+
+def _tf_normal(tf):
+    """Periyodu dogrula ve GORUNTU bicimine getir: dakika/saat kucuk, gun/hafta buyuk."""
+    t = str(tf or "").strip().lower()
+    if t not in TIMEFRAMES:
+        return None
+    return t.upper() if t in ("1d", "1w") else t
 NEEDS_P1 = {"ema_cross", "oi_change", "volume"}   # rsi periyodu sabit 14
 
 
@@ -282,8 +302,8 @@ def validate_dynamic(d, prefix, etiket):
     err = []
     out = {f"{prefix}_active": True}
 
-    tf = (d.get(f"{prefix}_timeframe") or "5m").lower()
-    if tf not in TIMEFRAMES:
+    tf = _tf_normal(d.get(f"{prefix}_timeframe") or "5m")
+    if tf is None:
         err.append(f"{etiket}: periyot gecersiz")
     else:
         out[f"{prefix}_timeframe"] = tf
@@ -325,9 +345,10 @@ def validate_rule(d):
     if direction not in ("SHORT", "LONG"):
         err.append("yon SHORT veya LONG olmali")
 
-    tf = (d.get("timeframe") or "5m").lower()
-    if tf not in TIMEFRAMES:
-        err.append(f"periyot gecersiz (izinli: {', '.join(sorted(TIMEFRAMES))})")
+    tf = _tf_normal(d.get("timeframe") or "5m")
+    if tf is None:
+        err.append("periyot gecersiz (izinli: 5m, 15m, 30m, 1h, 4h, 1D, 1W)")
+        tf = "5m"
 
     logic = (d.get("logic") or "AND").upper()
     if logic == "-":
@@ -432,6 +453,7 @@ def gather_state():
         "settings": settings,
         "webhooks": webhooks,
         "webhook_enabled": bool(WEBHOOK_TOKEN),
+        "panel_version": VERSION,
         "webhook_token": WEBHOOK_TOKEN,   # hazir mesaj uretmek icin (panel auth'lu)
         "trades": trades,
         "events": events,
@@ -692,187 +714,482 @@ HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="theme-color" content="#F5F2EA">
+<meta name="theme-color" content="#ffffff">
 <title>STS Panel</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
+/* ============================================================
+   TASARIM 2 — yuksek kontrastli, siyah/beyaz temelli borsa temasi
+   Pill sekmeler, mint/kizil yon renkleri, sifira yakin golge.
+   ============================================================ */
+
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+/* --- 1. Degiskenler --- */
 :root{
-  --bg:#F5F2EA; --surface:#FCFAF6; --surface2:#EDE8DC; --border:#DCD5C6;
-  --text:#1A1815; --text2:#6B655C; --text3:#9B948A;
-  --green:#2D6A4F; --greenBg:#E2EDE6; --greenBd:#BBD4C4;
-  --coral:#C9553B; --coralBg:#F7E4DE; --coralBd:#E8C0B4;
-  --purple:#6B4E9B; --purpleBg:#EBE4F5;
-  --amber:#8A6410; --amberBg:#F5EBD3;
-  --shadow:0 1px 2px rgba(26,24,21,.05);
+  --bg:#ffffff;
+  --surface:#ffffff;
+  --surface2:#f2f3f5;
+  --border:#e3e5e9;
+  --text:#000000;
+  --text2:#5c6068;
+  --text3:#93979f;
+
+  --green:#00915f;   --greenBg:#e2f6ee;  --greenBd:#9fdcc4;
+  --coral:#e5333f;   --coralBg:#fdeaeb;  --coralBd:#f5b0b5;
+  --purple:#2a5cff;  --purpleBg:#e8eeff;
+  --amber:#a86a00;   --amberBg:#fdf1da;
+  --shadow:0 0 0 0 transparent;
+
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:"DM Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --r:4px;
 }
+
 [data-theme="dark"]{
-  --bg:#15140F; --surface:#1E1C16; --surface2:#272419; --border:#3B372C;
-  --text:#F2EDE2; --text2:#A69F91; --text3:#746D60;
-  --green:#74C494; --greenBg:#1A3226; --greenBd:#2A4C38;
-  --coral:#E8836A; --coralBg:#3A211A; --coralBd:#5A342A;
-  --purple:#B79BE8; --purpleBg:#2A2140;
-  --amber:#DCA83A; --amberBg:#33280F;
-  --shadow:none;
+  --bg:#000000;
+  --surface:#0d0e11;
+  --surface2:#17181c;
+  --border:#23252b;
+  --text:#ffffff;
+  --text2:#9296a0;
+  --text3:#5e626b;
+
+  --green:#00d18f;   --greenBg:rgba(0,209,143,.14);  --greenBd:rgba(0,209,143,.34);
+  --coral:#ff4d5e;   --coralBg:rgba(255,77,94,.14);  --coralBd:rgba(255,77,94,.34);
+  --purple:#5b8cff;  --purpleBg:rgba(91,140,255,.16);
+  --amber:#f0b03c;   --amberBg:rgba(240,176,60,.14);
+  --shadow:0 0 0 0 transparent;
 }
-*{box-sizing:border-box;margin:0;padding:0}
+
+/* --- 2. Temel --- */
+*,*::before,*::after{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{
-  font-family:'Archivo',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-  background:var(--bg); color:var(--text);
-  padding:14px; max-width:1160px; margin:0 auto;
-  transition:background .2s,color .2s;
+  margin:0;background:var(--bg);color:var(--text);
+  font:400 12px/1.4 var(--sans);letter-spacing:-.004em;
+  -webkit-font-smoothing:antialiased;
 }
-.mono{font-family:'JetBrains Mono',ui-monospace,'SF Mono',Consolas,monospace}
+h1,h2,h3,h4{margin:0;font-weight:700;letter-spacing:-.025em}
+a{color:var(--purple);text-decoration:none}
+a:hover{color:var(--purple);text-decoration:underline}
+::selection{background:var(--purpleBg);color:var(--text)}
 
-/* ---------- header ---------- */
-.hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;
-  padding:14px 18px;background:var(--surface);border:1px solid var(--border);
-  border-radius:14px;margin-bottom:12px;flex-wrap:wrap;box-shadow:var(--shadow)}
-.brand{font-size:22px;font-weight:800;letter-spacing:-.02em}
-.hdr-l{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.hdr-r{display:flex;align-items:center;gap:8px}
+/* --- 3. Baslik --- */
+.hdr{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  height:44px;padding:0 14px;
+  background:var(--surface);border-bottom:1px solid var(--border);
+  position:sticky;top:0;z-index:50;
+}
+.hdr-l,.hdr-r{display:flex;align-items:center;gap:7px;min-width:0}
+/* seviye butonlarini yardimci ikonlardan AYIR - kazara Duraklat'a basilmasin */
+#btn-pause{margin-left:22px;position:relative}
+#btn-pause::before{content:"";position:absolute;left:-12px;top:4px;bottom:4px;
+  width:1px;background:var(--border)}
+.hdr-r{justify-content:flex-end}
+.brand{
+  font:800 14px/1 var(--sans);letter-spacing:-.03em;color:var(--text);
+  white-space:nowrap;margin-right:6px;
+}
 
-.badge{font-size:10px;font-weight:700;padding:3px 9px;border-radius:20px;
-  letter-spacing:.06em;text-transform:uppercase;border:1px solid transparent;white-space:nowrap}
-.b-test{background:var(--amberBg);color:var(--amber);border-color:var(--amber)}
-.b-live{background:var(--coralBg);color:var(--coral);border-color:var(--coral)}
-.b-ok{background:var(--greenBg);color:var(--green);border-color:var(--greenBd)}
-.b-off{background:var(--coralBg);color:var(--coral);border-color:var(--coralBd)}
-.b-short{background:var(--coralBg);color:var(--coral)}
-.b-long{background:var(--greenBg);color:var(--green)}
-.b-sig{background:var(--surface2);color:var(--text2)}
-.b-rule{background:var(--purpleBg);color:var(--purple)}
+.brand::before{
+  content:"";flex:none;width:22px;height:22px;border-radius:6px;
+  background-color:var(--text);
+  background-image:
+    linear-gradient(var(--green),var(--green)),
+    linear-gradient(var(--green),var(--green)),
+    linear-gradient(var(--coral),var(--coral));
+  background-size:3px 6px,3px 10px,3px 14px;
+  background-position:5px 12px,10px 8px,15px 4px;
+  background-repeat:no-repeat;
+}
+.brand{display:inline-flex;align-items:center;gap:8px}
 
-.btn{font-family:inherit;font-size:12px;font-weight:600;padding:8px 14px;
-  border-radius:9px;border:1px solid var(--border);background:var(--surface);
-  color:var(--text);cursor:pointer;transition:.15s;white-space:nowrap}
-.btn:hover{background:var(--surface2)}
-.btn-stop{border-color:var(--coralBd);background:var(--coralBg);color:var(--coral)}
-.btn-go{border-color:var(--greenBd);background:var(--greenBg);color:var(--green)}
-@keyframes donus{from{transform:rotate(0)}to{transform:rotate(360deg)}}
-.doner{animation:donus .6s linear infinite}
-.icon-btn{width:36px;height:36px;padding:0;display:grid;place-items:center;font-size:15px}
+/* --- 4. Rozetler (pill) --- */
+.badge{
+  display:inline-flex;align-items:center;gap:5px;
+  height:19px;padding:0 8px;border-radius:999px;
+  font:600 10px/1 var(--sans);letter-spacing:.04em;text-transform:uppercase;
+  background:var(--surface2);border:1px solid transparent;color:var(--text2);
+  white-space:nowrap;vertical-align:middle;
+}
+.b-test{background:var(--amberBg);color:var(--amber)}
+.b-live{background:var(--greenBg);color:var(--green)}
+.b-live::before{content:"";width:5px;height:5px;border-radius:50%;background:var(--green)}
+.b-ok{background:var(--greenBg);color:var(--green)}
+.b-off{background:var(--surface2);color:var(--text3)}
+.b-short{background:var(--coral);color:#fff}
+.b-long{background:var(--green);color:#001a12}
+[data-theme="dark"] .b-long{color:#00150e}
+.b-sig{background:var(--purpleBg);color:var(--purple)}
+.b-rule{background:var(--amberBg);color:var(--amber)}
+.b-done{background:var(--purpleBg);color:var(--purple)}
+.b-err{background:var(--coral);color:#fff}
 
-/* ---------- tabs ---------- */
-.tabs{display:flex;gap:4px;background:var(--surface2);padding:5px;
-  border-radius:11px;margin-bottom:16px;overflow-x:auto;-webkit-overflow-scrolling:touch}
-.tab{font-family:inherit;font-size:11px;font-weight:700;letter-spacing:.07em;
-  text-transform:uppercase;padding:9px 16px;border-radius:7px;color:var(--text2);
-  cursor:pointer;border:1px solid transparent;background:transparent;
-  transition:.15s;white-space:nowrap}
-.tab:hover{color:var(--text)}
-.tab.on{background:var(--surface);color:var(--text);border-color:var(--border);box-shadow:var(--shadow)}
+/* --- 5. Butonlar --- */
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  height:29px;padding:0 13px;border-radius:var(--r);
+  border:1px solid var(--border);background:var(--surface2);color:var(--text);
+  font:600 12px/1 var(--sans);cursor:pointer;
+  transition:background .12s,color .12s,border-color .12s;
+}
+.btn:hover{background:var(--border)}
+.btn:focus-visible,.icon-btn:focus-visible,.mini:focus-visible,
+input:focus-visible,select:focus-visible,textarea:focus-visible{
+  outline:2px solid var(--purple);outline-offset:1px;
+}
+.btn:disabled,.btn[disabled]{opacity:.4;cursor:not-allowed}
+.btn-go{background:var(--green);border-color:var(--green);color:#00150e}
+.btn-go:hover{filter:brightness(1.1);background:var(--green)}
+.btn-stop{background:var(--coral);border-color:var(--coral);color:#fff}
+.btn-stop:hover{filter:brightness(1.1);background:var(--coral)}
 
-/* ---------- section labels ---------- */
-.sect{font-size:10px;font-weight:700;color:var(--text3);letter-spacing:.1em;
-  text-transform:uppercase;margin:0 0 9px 2px}
+.icon-btn{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:29px;height:29px;padding:0;border-radius:var(--r);
+  border:1px solid transparent;background:transparent;color:var(--text2);
+  font-size:13px;line-height:1;cursor:pointer;transition:background .12s,color .12s;
+}
+.icon-btn:hover{background:var(--surface2);color:var(--text)}
 
-/* ---------- metrics ---------- */
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));
-  gap:10px;margin-bottom:18px}
-.met{background:var(--surface);border:1px solid var(--border);border-radius:13px;
-  padding:14px 16px;box-shadow:var(--shadow)}
-.met .l{font-size:11px;font-weight:500;color:var(--text2);margin-bottom:5px;letter-spacing:.01em}
-.met .v{font-size:26px;font-weight:800;letter-spacing:-.03em;line-height:1.05}
-.met .s{font-size:11px;color:var(--text3);margin-top:4px}
-.up{color:var(--green)}.dn{color:var(--coral)}.mut{color:var(--text2)}
+.mini{
+  display:inline-flex;align-items:center;justify-content:center;gap:4px;
+  height:20px;padding:0 8px;border-radius:999px;
+  border:1px solid var(--border);background:transparent;color:var(--text2);
+  font:600 10px/1 var(--sans);letter-spacing:.03em;text-transform:uppercase;cursor:pointer;
+  transition:background .12s,color .12s,border-color .12s;
+}
+.mini:hover{background:var(--surface2);color:var(--text)}
+.mini.del{color:var(--coral);border-color:var(--coralBd)}
+.mini.del:hover{background:var(--coral);border-color:var(--coral);color:#fff}
 
-/* ---------- cards ---------- */
-.card{background:var(--surface);border:1px solid var(--border);border-radius:13px;
-  padding:14px 16px;margin-bottom:12px;box-shadow:var(--shadow)}
+.xbtn{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:18px;height:18px;padding:0;border:0;border-radius:50%;
+  background:transparent;color:var(--text3);font:400 14px/1 var(--sans);cursor:pointer;
+}
+.xbtn:hover{background:var(--coral);color:#fff}
 
-/* ---------- positions ---------- */
-.pos{display:flex;align-items:center;justify-content:space-between;gap:10px;
-  padding:13px 15px;background:var(--surface);border:1px solid var(--border);
-  border-radius:12px;margin-bottom:8px;flex-wrap:wrap;box-shadow:var(--shadow)}
-.pos-l{min-width:0;flex:1}
-.pos-nm{display:flex;align-items:center;gap:7px;margin-bottom:5px;flex-wrap:wrap}
-.pos-nm b{font-size:16px;font-weight:800;letter-spacing:-.02em}
-.pos-dt{font-size:11px;color:var(--text2)}
-.pos-dt span{color:var(--text3)}
-.pos-r{text-align:right}
-.pnl{font-size:19px;font-weight:800;letter-spacing:-.02em;line-height:1.1}
-.pnl-pct{font-size:12px;font-weight:600;margin-top:1px}
+/* --- 6. Sekmeler: pill grup --- */
+.tabs{
+  display:flex;align-items:center;gap:3px;
+  padding:7px 12px;background:var(--surface);
+  border-bottom:1px solid var(--border);
+  overflow-x:auto;scrollbar-width:none;
+}
+.tabs::-webkit-scrollbar{display:none}
+.tab{
+  display:inline-flex;align-items:center;gap:6px;
+  height:26px;padding:0 12px;border:0;border-radius:999px;
+  background:transparent;color:var(--text2);
+  font:600 12px/1 var(--sans);white-space:nowrap;cursor:pointer;
+  transition:background .12s,color .12s;
+}
+.tab:hover{background:var(--surface2);color:var(--text)}
+.tab.on{background:var(--text);color:var(--bg)}
+.tab.on:hover{background:var(--text);color:var(--bg)}
 
-/* ---------- tables ---------- */
-.tw{overflow-x:auto;-webkit-overflow-scrolling:touch}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th{text-align:left;font-size:10px;font-weight:700;color:var(--text3);
-  letter-spacing:.07em;text-transform:uppercase;padding:8px 10px;
-  border-bottom:1px solid var(--border);white-space:nowrap}
-td{padding:10px;border-bottom:1px solid var(--border);color:var(--text);white-space:nowrap}
-tbody tr:last-child td{border-bottom:none}
-tbody tr:hover{background:var(--surface2)}
-.empty{color:var(--text3);font-size:12px;padding:26px;text-align:center}
+/* --- 7. Metrikler --- */
+.grid{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+  gap:8px;
+}
+.met{
+  display:flex;flex-direction:column;gap:4px;
+  padding:10px 12px;background:var(--surface2);
+  border:1px solid transparent;border-radius:var(--r);min-width:0;
+}
+.met .l{
+  font:500 10.5px/1 var(--sans);letter-spacing:.02em;color:var(--text3);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.met .v{
+  font:600 19px/1.1 var(--mono);letter-spacing:-.03em;color:var(--text);
+  font-variant-numeric:tabular-nums;
+}
+.met .s{font:400 10.5px/1.2 var(--mono);color:var(--text2);font-variant-numeric:tabular-nums}
+.met .v.up,.met .s.up{color:var(--green)}
+.met .v.dn,.met .s.dn{color:var(--coral)}
 
-/* ---------- form ---------- */
-label{font-size:11px;font-weight:500;color:var(--text2);display:block;margin-bottom:5px}
-input,select{width:100%;font-family:inherit;font-size:13px;background:var(--bg);
-  border:1px solid var(--border);border-radius:8px;color:var(--text);
-  padding:9px 10px;transition:.15s}
-input:focus,select:focus{outline:none;border-color:var(--text2)}
-input:disabled{background:var(--surface2);color:var(--text3);cursor:not-allowed}
-input::placeholder{color:var(--text3)}
-select{cursor:pointer;-webkit-appearance:none;appearance:none;
-  background-image:linear-gradient(45deg,transparent 50%,var(--text2) 50%),
-  linear-gradient(135deg,var(--text2) 50%,transparent 50%);
-  background-position:calc(100% - 15px) 50%,calc(100% - 10px) 50%;
-  background-size:5px 5px,5px 5px;background-repeat:no-repeat;padding-right:28px}
-.frow{display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));
-  gap:11px;margin-bottom:11px}
-.crow{display:grid;grid-template-columns:150px 82px 62px 1fr 34px;gap:7px;
-  align-items:center;margin-bottom:7px}
-.crow.single{grid-template-columns:150px 62px 1fr 34px}
-.cunit{position:relative;display:flex;align-items:center}
-.cunit input{padding-right:30px}
-.cunit .u{position:absolute;right:10px;font-size:11px;font-weight:600;
-  color:var(--text3);pointer-events:none}
-.xbtn{font-family:inherit;background:var(--coralBg);border:1px solid var(--coralBd);
-  color:var(--coral);border-radius:8px;cursor:pointer;height:36px;font-size:14px;
-  font-weight:700;display:grid;place-items:center}
-.mini{font-family:inherit;background:transparent;border:1px solid var(--border);
-  color:var(--text2);border-radius:7px;cursor:pointer;padding:5px 10px;
-  font-size:11px;font-weight:600;margin-left:5px;transition:.15s}
-.mini:hover{border-color:var(--text2);color:var(--text)}
-.mini.del:hover{border-color:var(--coralBd);color:var(--coral);background:var(--coralBg)}
+/* --- 8. Pozisyon satiri --- */
+.pos{
+  display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:9px 12px;background:var(--surface);
+  border:1px solid var(--border);border-radius:var(--r);
+}
+.pos + .pos{margin-top:-1px;border-radius:0}
+.pos:hover{background:var(--surface2)}
+.pos-l{display:flex;flex-direction:column;gap:3px;min-width:0}
+.pos-nm{display:flex;align-items:center;gap:6px;font:700 13px/1.1 var(--sans);letter-spacing:-.02em}
+.pos-dt{
+  font:400 10.5px/1.2 var(--mono);color:var(--text3);
+  font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.pos-r{display:flex;flex-direction:column;align-items:flex-end;gap:2px;flex:none}
+.pnl{font:600 15px/1.1 var(--mono);letter-spacing:-.02em;font-variant-numeric:tabular-nums;color:var(--text)}
+.pnl-pct{font:500 11px/1.1 var(--mono);font-variant-numeric:tabular-nums;color:var(--text2)}
+.pos .up,.pnl.up,.pnl-pct.up{color:var(--green)}
+.pos .dn,.pnl.dn,.pnl-pct.dn{color:var(--coral)}
+
+/* --- 9. Tablolar --- */
+.tw{border:1px solid var(--border);border-radius:var(--r);background:var(--surface);overflow:auto}
+.tw table{width:100%;border-collapse:collapse;font-size:11.5px}
+.tw th{
+  position:sticky;top:0;z-index:2;padding:8px 12px;text-align:left;white-space:nowrap;
+  background:var(--surface);color:var(--text3);
+  font:500 10.5px/1 var(--sans);letter-spacing:.02em;
+  border-bottom:1px solid var(--border);
+}
+.tw td{
+  padding:7px 12px;color:var(--text);white-space:nowrap;vertical-align:middle;
+  border-bottom:1px solid var(--border);
+}
+.tw tbody tr:last-child td{border-bottom:0}
+.tw tbody tr:nth-child(even) td{background:var(--surface2)}
+.tw tbody tr:hover td{background:var(--purpleBg)}
+.tw th:not(:first-child),.tw td:not(:first-child){text-align:right}
+.tw th:first-child,.tw td:first-child{text-align:left;font-weight:600}
+.tw td.mono,.tw td .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.tw td.up,.tw td .up{color:var(--green)}
+.tw td.dn,.tw td .dn{color:var(--coral)}
+.tw td.mut,.tw td .mut{color:var(--text3)}
+.empty{padding:30px 12px;text-align:center;color:var(--text3);font-size:11.5px;background:var(--surface)}
+
+/* --- 10. Formlar --- */
+label{
+  display:block;margin-bottom:5px;
+  font:500 10.5px/1 var(--sans);letter-spacing:.01em;color:var(--text3);
+}
+input,select,textarea{
+  width:100%;height:30px;padding:0 9px;
+  background:var(--surface2);color:var(--text);
+  border:1px solid var(--border);border-radius:var(--r);
+  font:500 12px/1 var(--mono);font-variant-numeric:tabular-nums;
+  transition:border-color .12s,background .12s;
+}
+textarea{height:auto;min-height:66px;padding:8px 9px;line-height:1.5;resize:vertical}
+select{
+  appearance:none;padding-right:24px;cursor:pointer;
+  background-image:linear-gradient(45deg,transparent 50%,currentColor 50%),
+                   linear-gradient(135deg,currentColor 50%,transparent 50%);
+  background-position:calc(100% - 13px) 13px,calc(100% - 9px) 13px;
+  background-size:4px 4px,4px 4px;background-repeat:no-repeat;
+}
+input:hover,select:hover,textarea:hover{border-color:var(--border-strong,var(--text3))}
+input:focus,select:focus,textarea:focus{border-color:var(--purple);background:var(--surface);outline:none}
+input::placeholder,textarea::placeholder{color:var(--text3);font-family:var(--sans)}
+input:disabled,select:disabled,textarea:disabled{opacity:.45;cursor:not-allowed}
+input[type="checkbox"],input[type="radio"]{width:14px;height:14px;padding:0;accent-color:var(--purple);cursor:pointer;flex:none}
+
+.frow{display:flex;flex-wrap:wrap;gap:9px;align-items:flex-end}
+.frow > *{flex:1 1 150px;min-width:0}
+.crow{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.crow.single{grid-template-columns:1fr}
+.cunit{position:relative;display:flex;align-items:stretch;min-width:0}
+.cunit input,.cunit select{padding-right:52px}
+.cunit .u{
+  position:absolute;right:1px;top:1px;bottom:1px;
+  display:inline-flex;align-items:center;padding:0 9px;
+  background:transparent;border-left:1px solid var(--border);
+  border-radius:0 var(--r) var(--r) 0;
+  font:600 10.5px/1 var(--mono);color:var(--text3);white-space:nowrap;pointer-events:none;
+}
+/* .divider panelde hem ayirici hem KAPSAYICI - height:1px icerigi tasirirdi */
 .divider{border-top:1px solid var(--border);padding-top:12px;margin-top:12px}
-.stopband{background:var(--coralBg);border:1px solid var(--coral);color:var(--coral);
-  border-radius:12px;padding:12px 16px;margin-bottom:12px;font-size:12px;line-height:1.6}
-.pospanel{background:var(--surface);border:1px solid var(--border);border-radius:12px;
-  padding:14px 16px;margin:-4px 0 8px;box-shadow:var(--shadow);flex-basis:100%}
-.cprow{display:flex;gap:8px;align-items:stretch;margin-top:4px}
-.cprow input,.cprow textarea{flex:1;font-family:'JetBrains Mono',monospace;
-  font-size:11px;line-height:1.5;resize:vertical}
-.cprow .btn{white-space:nowrap;align-self:flex-start}
-.dynbox{background:var(--bg);border:1px solid var(--border);border-radius:11px;
-  padding:12px 14px;margin-bottom:10px}
-.dynhead{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
-.dynhint{font-size:11px;color:var(--text3)}
-.chk{display:flex;align-items:center;gap:8px;cursor:pointer;margin:0}
-.chk input{width:16px;height:16px;accent-color:var(--green);cursor:pointer}
-.chk span{font-size:13px;font-weight:600;color:var(--text)}
-.okbox{background:var(--greenBg);border:1px solid var(--greenBd);border-radius:9px;
-  padding:10px 12px;margin-top:10px;font-size:11px;color:var(--green);line-height:1.5}
-.warnbox{background:var(--amberBg);border:1px solid var(--amber);border-radius:9px;
-  padding:10px 12px;margin-top:10px;font-size:11px;color:var(--amber);line-height:1.5}
-.errbox{display:none;background:var(--coralBg);border:1px solid var(--coralBd);
-  border-radius:9px;padding:11px 13px;margin-top:12px;font-size:12px;color:var(--coral)}
-#toast{position:fixed;bottom:18px;right:18px;background:var(--text);color:var(--bg);
-  border-radius:10px;padding:12px 18px;font-size:12px;font-weight:600;
-  display:none;z-index:99;box-shadow:0 4px 12px rgba(0,0,0,.15)}
 
-@media(max-width:720px){
-  body{padding:10px}
-  .brand{font-size:19px}
-  .met .v{font-size:22px}
-  .crow,.crow.single{grid-template-columns:1fr 1fr;gap:6px}
-  .crow>*:first-child{grid-column:1/-1}
-  .crow .xbtn{grid-column:1/-1}
-  th,td{padding:8px 7px;font-size:11px}
-  .pnl{font-size:16px}
+/* --- 11. Kutular --- */
+.errbox,.warnbox,.okbox{
+  padding:9px 11px;border-radius:var(--r);border:0;border-left:2px solid;
+  font-size:11.5px;line-height:1.5;
 }
+.errbox{background:var(--coralBg);border-color:var(--coral);color:var(--coral)}
+.warnbox{background:var(--amberBg);border-color:var(--amber);color:var(--amber)}
+.okbox{background:var(--greenBg);border-color:var(--green);color:var(--green)}
+
+.stopband{
+  display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:8px 12px;background:var(--coral);border-radius:var(--r);
+  color:#fff;font:600 11.5px/1.3 var(--sans);
+}
+.stopband .mini,.stopband .mini.del{border-color:rgba(255,255,255,.5);color:#fff;background:transparent}
+.stopband .mini:hover{background:rgba(255,255,255,.16);color:#fff}
+
+.dynbox{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);overflow:hidden}
+.dynhead{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+  padding:8px 12px;background:transparent;border-bottom:1px solid var(--border);
+  font:700 11.5px/1 var(--sans);letter-spacing:-.01em;color:var(--text);
+}
+.dynhint{padding:8px 12px;font-size:10.5px;line-height:1.5;color:var(--text3);background:var(--surface2)}
+.dynbox > .frow,.dynbox > .crow{padding:11px}
+
+.chk{
+  display:flex;align-items:center;gap:7px;
+  padding:6px 10px;border:1px solid transparent;border-radius:999px;
+  background:var(--surface2);cursor:pointer;font:500 11.5px/1 var(--sans);color:var(--text);
+}
+.chk:hover{background:var(--border)}
+.chk label{margin:0;font:inherit;letter-spacing:0;color:inherit;cursor:pointer}
+
+.pospanel{padding:11px;background:var(--surface2);border-radius:var(--r)}
+.cprow{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+  padding:5px 0;font-size:11.5px;color:var(--text2);
+}
+.cprow > :last-child{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--text);font-weight:500}
+
+/* --- 12. Yardimci --- */
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.015em}
+.up{color:var(--green)}
+.dn{color:var(--coral)}
+.mut{color:var(--text3)}
+.sect{
+  display:block;margin:16px 0 8px;
+  font:700 13px/1 var(--sans);letter-spacing:-.025em;color:var(--text);
+}
+#toast{
+  position:fixed;left:50%;bottom:20px;transform:translateX(-50%);z-index:200;
+  max-width:min(92vw,420px);padding:10px 16px;
+  background:var(--text);color:var(--bg);
+  border:0;border-radius:999px;
+  font:600 12px/1.4 var(--sans);text-align:center;
+}
+#toast.err{background:var(--coral);color:#fff}
+#toast.ok{background:var(--green);color:#00150e}
+
+*::-webkit-scrollbar{width:9px;height:9px}
+*::-webkit-scrollbar-thumb{background:var(--border);border-radius:6px}
+*::-webkit-scrollbar-thumb:hover{background:var(--text3)}
+*::-webkit-scrollbar-track{background:transparent}
+
+/* --- 13. Mobil --- */
+@media (max-width:720px){
+  .hdr{height:auto;flex-wrap:wrap;gap:6px;padding:8px 10px}
+  .hdr-l,.hdr-r{flex:1 1 100%;flex-wrap:wrap}
+  .hdr-r{justify-content:flex-start}
+
+  .tabs{padding:6px 8px}
+  .tab{height:30px}
+
+  .grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
+  .met{padding:9px 10px}
+  .met .v{font-size:16px}
+
+  .pos{flex-direction:column;align-items:stretch;gap:6px;border-radius:var(--r)}
+  .pos + .pos{margin-top:6px;border-radius:var(--r)}
+  .pos-r{flex-direction:row;gap:8px;align-items:baseline}
+
+  .frow > *{flex:1 1 100%}
+  .crow{grid-template-columns:1fr}
+
+  .btn,.icon-btn{height:36px}
+  .icon-btn{width:36px}
+  .mini{height:26px;padding:0 11px}
+  input,select{height:36px}
+
+  .tw table{font-size:11px}
+  .tw th,.tw td{padding:7px 9px}
+
+  #toast{left:10px;right:10px;transform:none;max-width:none}
+}
+
+/* ============================================================
+   UYUM KATMANI — mevcut panel yapisinin gerektirdigi eklemeler
+   (tasarimin gorunumunu bozmaz, eksikleri tamamlar)
+   ============================================================ */
+
+/* Sekme panelleri: tasarimda govde padding'i yok, icerik kenara yapisirdi */
+#p-durum,#p-islemler,#p-olaylar,#p-kurallar,#p-ayarlar{
+  padding:14px;max-width:1280px;margin:0 auto;
+}
+
+/* .card — panelde yogun kullanilan kapsayici, tasarimda tanimli degildi */
+.card{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--r);padding:12px;margin-bottom:10px;
+}
+.card > .sect:first-child{margin-top:0}
+
+/* Hata kutulari JS tarafindan display:block ile aciliyor -> varsayilan gizli */
+.errbox{display:none}
+
+/* .doner buton uzerine SINIF olarak ekleniyor (spinner elemani degil) */
+.doner{animation:doner-spin .7s linear infinite}
+@keyframes doner-spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.doner{animation-duration:2.4s}}
+
+/* Kosul satiri: 4-5 kolonlu duzen (tip | p1 | operator | p2 | sil) */
+.crow{grid-template-columns:150px 82px 62px 1fr 34px;align-items:center;gap:7px}
+.crow.single{grid-template-columns:150px 62px 1fr 34px}
+@media (max-width:720px){
+  .crow,.crow.single{grid-template-columns:1fr 1fr;gap:6px}
+  .crow > *:first-child{grid-column:1/-1}
+  .crow .xbtn{grid-column:1/-1}
+}
+
+/* Kosul satirindaki birim etiketi p2 alanina yakin dursun */
+.crow .cunit input{padding-right:30px}
+.crow .cunit .u{border-left:0;padding:0 8px}
+
+/* .u2 birim etiketi (JS ile doldurulur) */
+.crow .u2{min-width:14px;text-align:right}
+
+/* Dinamik blok govdesi: dogrudan cocuk olmayan frow'lar da nefes alsin */
+.dynbox .frow,.dynbox .crow,.dynbox > div > .frow{padding-left:11px;padding-right:11px}
+.dynbox .warnbox{margin:0 11px 11px}
+.dynbox button{margin-left:11px;margin-bottom:11px}
+
+/* Kopyala satiri: input + buton yan yana (tasarimda anahtar-deger satiriydi) */
+.cprow{align-items:flex-start;padding:0;margin-top:4px}
+.cprow input,.cprow textarea{flex:1 1 auto;font-family:var(--mono);font-size:11px}
+.cprow .btn{flex:none;white-space:nowrap}
+.cprow > :last-child{font-weight:600}
+
+/* Pozisyon yonetim paneli acik pozisyon kartinin altinda tam genislik */
+.pospanel{margin:-1px 0 8px;border:1px solid var(--border);border-top:0;
+  border-radius:0 0 var(--r) var(--r);flex-basis:100%}
+
+/* Xbtn kosul satirinda daha rahat tiklanabilir olsun */
+.crow .xbtn{width:26px;height:26px;border:1px solid var(--coralBd);
+  border-radius:var(--r);color:var(--coral);background:var(--coralBg)}
+.crow .xbtn:hover{background:var(--coral);color:#fff}
+
+/* ---- FORM DUZENI ----
+   Tasarim .frow'u flex yapti; panelin formunda .frow bazen KAPSAYICI
+   (icinde divider + baslik + baska satirlar) olarak kullaniliyor.
+   Bu bloklarin satir olarak akmasi gerekiyor, yan yana dizilmemeli. */
+.divider.frow{display:flex;flex-wrap:wrap}
+.divider > .sect,.divider > p{flex-basis:100%;margin-top:0}
+
+/* Kosullar bolumu: baslik satiri + kosul listesi alt alta */
+#rule-form > .divider{display:block}
+#rule-form > .divider > div:first-child{display:flex;align-items:center;
+  justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:9px}
+
+/* Dinamik cikis bolumu bloklari tam genislik */
+.dynbox{flex-basis:100%;margin-bottom:10px}
+.dynbox .frow{padding:0 11px}
+.dynbox .frow:first-of-type{padding-top:11px}
+
+/* Form icindeki bolum basliklari ustteki alandan ayrilsin */
+#rule-form .sect{margin:0 0 4px}
+
+/* Kaydet/Iptal satiri tam genislik, saga yatik */
+#rule-form > div:last-child{flex-basis:100%}
+
+/* JSON alani ve kayitli kurallar formun ALTINDA kalsin */
+#p-kurallar > .card{margin-bottom:12px}
+
+/* Kural tablosunda kosul metni tasmasin */
+.tw td .mono{white-space:normal;word-break:break-word}
+
+/* Olaylar/detay hucreleri uzun metinde sarsin */
+.tw td[style*="white-space:normal"]{max-width:520px}
+
 </style>
 </head>
 <body>
@@ -884,6 +1201,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
     <span id="health" class="badge b-off">Baglaniyor</span>
   </div>
   <div class="hdr-r">
+    <span id="ver" class="badge b-off" title="Panel / Executor surumu">&mdash;</span>
     <span id="lvl-state" class="badge b-ok">&mdash;</span>
     <button class="btn icon-btn" onclick="elleYenile(this)" id="refresh-btn" title="Yenile">&#8635;</button>
     <button class="btn icon-btn" onclick="toggleTheme()" id="theme-btn" title="Tema">&#9789;</button>
@@ -958,7 +1276,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
         <div><label>Yon</label><select id="f-dir"><option value="SHORT">Short</option><option value="LONG">Long</option></select></div>
         <div><label>Periyot</label><select id="f-tf">
           <option value="5m">5m</option><option value="15m">15m</option><option value="30m">30m</option>
-          <option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
+          <option value="1h">1h</option><option value="4h">4h</option><option value="1D">1D</option>
         </select></div>
       </div>
 
@@ -1010,7 +1328,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
           <div class="frow" style="margin-top:10px">
             <div><label>Periyot</label><select id="dtp-tf">
               <option value="5m">5m</option><option value="15m">15m</option><option value="30m">30m</option>
-              <option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
+              <option value="1h">1h</option><option value="4h">4h</option><option value="1D">1D</option>
             </select></div>
             <div><label>Hard ile iliski</label><select id="dtp-mode" onchange="dynModeWarn('dtp')">
               <option value="OR">VEYA - hangisi once gelirse</option>
@@ -1039,7 +1357,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
           <div class="frow" style="margin-top:10px">
             <div><label>Periyot</label><select id="dsl-tf">
               <option value="5m">5m</option><option value="15m">15m</option><option value="30m">30m</option>
-              <option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
+              <option value="1h">1h</option><option value="4h">4h</option><option value="1D">1D</option>
             </select></div>
             <div><label>Hard ile iliski</label><select id="dsl-mode" onchange="dynModeWarn('dsl')">
               <option value="OR">VEYA - hangisi once gelirse</option>
@@ -1146,7 +1464,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
           <div class="frow" style="margin-top:10px">
             <div><label>Periyot</label><select id="stp-tf">
               <option value="5m">5m</option><option value="15m">15m</option><option value="30m">30m</option>
-              <option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
+              <option value="1h">1h</option><option value="4h">4h</option><option value="1D">1D</option>
             </select></div>
             <div><label>Hard ile iliski</label><select id="stp-mode" onchange="dynModeWarn('stp')">
               <option value="OR">VEYA - hangisi once gelirse</option>
@@ -1175,7 +1493,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
           <div class="frow" style="margin-top:10px">
             <div><label>Periyot</label><select id="ssl-tf">
               <option value="5m">5m</option><option value="15m">15m</option><option value="30m">30m</option>
-              <option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
+              <option value="1h">1h</option><option value="4h">4h</option><option value="1D">1D</option>
             </select></div>
             <div><label>Hard ile iliski</label><select id="ssl-mode" onchange="dynModeWarn('ssl')">
               <option value="OR">VEYA - hangisi once gelirse</option>
@@ -1226,7 +1544,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
           <div class="frow" style="margin-top:10px">
             <div><label>Periyot</label><select id="wtp-tf">
               <option value="5m">5m</option><option value="15m">15m</option><option value="30m">30m</option>
-              <option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
+              <option value="1h">1h</option><option value="4h">4h</option><option value="1D">1D</option>
             </select></div>
             <div><label>Hard ile iliski</label><select id="wtp-mode" onchange="dynModeWarn('wtp')">
               <option value="OR">VEYA - hangisi once gelirse</option>
@@ -1255,7 +1573,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
           <div class="frow" style="margin-top:10px">
             <div><label>Periyot</label><select id="wsl-tf">
               <option value="5m">5m</option><option value="15m">15m</option><option value="30m">30m</option>
-              <option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
+              <option value="1h">1h</option><option value="4h">4h</option><option value="1D">1D</option>
             </select></div>
             <div><label>Hard ile iliski</label><select id="wsl-mode" onchange="dynModeWarn('wsl')">
               <option value="OR">VEYA - hangisi once gelirse</option>
@@ -1371,7 +1689,7 @@ function applyTheme(t){
   document.documentElement.setAttribute('data-theme', t);
   document.getElementById('theme-btn').innerHTML = (t==='dark') ? '&#9788;' : '&#9789;';
   var m=document.querySelector('meta[name=theme-color]');
-  if(m) m.setAttribute('content', t==='dark' ? '#15140F' : '#F5F2EA');
+  if(m) m.setAttribute('content', t==='dark' ? '#000000' : '#ffffff');
   try{localStorage.setItem('sts-theme',t)}catch(e){}
 }
 function toggleTheme(){
@@ -1514,6 +1832,19 @@ function render(){
   else if(age!==null){h.textContent='Executor sessiz ('+age+'s)';h.className='badge b-off';}
   else{h.textContent='Status yok';h.className='badge b-off';}
 
+  var pv=state.panel_version||'?', bv=(st.version||'?');
+  var vr=document.getElementById('ver');
+  if(pv===bv){
+    vr.textContent=pv;
+    vr.className='badge b-off';
+    vr.title='Panel ve executor ayni surumde: '+pv;
+  }else{
+    vr.textContent='P '+pv+' / B '+bv;
+    vr.className='badge b-test';
+    vr.title='SURUM UYUSMAZLIGI - panel '+pv+', executor '+bv
+      +'. Biri deploy edilmemis olabilir.';
+  }
+
   var seviye=(state.level||'RUN').toUpperCase();
   var ls=document.getElementById('lvl-state');
   ls.textContent=(state.emergency_pending?'ACIL CIKIS ISLENIYOR':(LVL_AD[seviye]||seviye));
@@ -1559,8 +1890,8 @@ function render(){
         +'<span class="badge '+(p.source==='rule'?'b-rule':'b-sig')+'">'+(p.source==='rule'?'Kural':'Sinyal')+'</span></div>'
         +'<div class="pos-dt mono"><span>Giris</span> '+fiyat(p.entry)
         +' &nbsp;<span>Mark</span> <b id="mark-'+tid+'" style="font-weight:400">'+fiyat(p.mark)+'</b>'
-        +' &nbsp;<span>TP</span> '+fiyat(p.tp)
-        +' &nbsp;<span>SL</span> '+fiyat(p.sl)
+        +' &nbsp;<span>TP</span> '+fiyat(p.tp)+korumaRozet(p.tp_order,'TP')
+        +' &nbsp;<span>SL</span> '+fiyat(p.sl)+korumaRozet(p.sl_order,'SL')
         +' &nbsp;<span>'+(p.leverage||'—')+'x</span>'
         +(m?' &nbsp;<span>'+usd(m,0)+'</span>':'')
         +'</div></div>'
@@ -1608,10 +1939,12 @@ function render(){
   var whs=state.webhooks||[];
   wb.innerHTML=whs.length?whs.map(function(w){
     var d;
+    var r=w.result||'';
     if(!w.executed){d='<span class="badge b-test">Bekliyor</span>';}
-    else if((w.result||'').indexOf('OPENED')===0){d='<span class="badge b-ok">Acildi</span>';}
-    else if((w.result||'').indexOf('SKIPPED')===0){d='<span class="badge b-sig">Atlandi</span>';}
-    else {d='<span class="badge b-off">Hata</span>';}
+    else if(r.indexOf('OPENED')===0){d='<span class="badge b-ok">Acildi</span>';}
+    else if(r.indexOf('CLOSED')===0){d='<span class="badge b-done">Kapatildi</span>';}
+    else if(r.indexOf('SKIPPED')===0){d='<span class="badge b-sig">Atlandi</span>';}
+    else {d='<span class="badge b-err">Hata</span>';}
     return '<tr><td class="mut">'+w.id+'</td>'
       +'<td class="mut mono">'+esc(trZaman(w.created_at,true))+'</td>'
       +'<td><b>'+esc(w.coin)+'</b></td>'
@@ -1624,7 +1957,7 @@ function render(){
   var evs=state.events||[];
   eb.innerHTML=evs.length?evs.map(function(e){
     return '<tr><td class="mut mono">'+esc(trZaman(e.ts,true))+'</td>'
-      +'<td>'+esc(e.kind)+'</td><td><b>'+esc(e.coin||'—')+'</b></td>'
+      +'<td>'+olayRozet(e.kind)+'</td><td><b>'+esc(e.coin||'—')+'</b></td>'
       +'<td style="white-space:normal">'+esc(e.detail||'')+'</td></tr>';
   }).join(''):'<tr><td colspan="4" class="empty">Olay yok</td></tr>';
 
@@ -1632,7 +1965,7 @@ function render(){
   var rules=state.rules||[];
   rb.innerHTML=rules.length?rules.map(function(r){
     var stt=r.active?'<span class="badge b-ok">Aktif</span>'
-      :(r.triggered_at?'<span class="badge b-rule">Tetiklendi</span>':'<span class="badge b-off">Pasif</span>');
+      :(r.triggered_at?'<span class="badge b-done">Tetiklendi</span>':'<span class="badge b-off">Pasif</span>');
     return '<tr><td class="mut">'+r.id+'</td><td><b>'+esc(r.coin)+'</b></td>'
       +'<td><span class="badge '+(r.direction==='LONG'?'b-long':'b-short')+'">'+esc(r.direction)+'</span></td>'
       +'<td>'+esc(r.timeframe)+'</td>'
@@ -1769,12 +2102,27 @@ function importJson(){
 }
 
 /* ---------- acik pozisyon yonetimi ---------- */
+/* Borsada koruma emri yoksa uyar: o taraf yalnizca bot izlemesine bagli.
+   Bot durursa (veya STOP seviyesinde) o koruma da durur. */
+function korumaRozet(varMi,tur){
+  if(varMi!==false)return '';
+  return ' <span class="badge b-test" title="Borsada '+tur+' emri YOK - koruma yalnizca'
+    +' bot tarafinda (yumusak '+tur+'). Bot durursa bu koruma da durur.">koruma bot</span>';
+}
+
 function posPanel(p,tid){
   return '<div id="pp-'+tid+'" class="pospanel" style="display:none">'
     +'<div class="frow">'
       +'<div><label>Hard TP</label><input id="pp-tp-'+tid+'" value="'+(p.tp==null?'':p.tp)+'"></div>'
       +'<div><label>Hard SL</label><input id="pp-sl-'+tid+'" value="'+(p.sl==null?'':p.sl)+'"></div>'
     +'</div>'
+    +((p.tp_order===false||p.sl_order===false)
+      ? '<div class="warnbox" style="display:block;margin-top:8px">'
+        +'<b>Koruma bot tarafinda.</b> Borsada '
+        +[(p.tp_order===false?'TP':null),(p.sl_order===false?'SL':null)].filter(Boolean).join(' ve ')
+        +' emri yok; bu seviye yalnizca botun yumusak izlemesiyle korunuyor. '
+        +'Bot durursa (veya Bot dur seviyesinde) koruma kalkar.</div>'
+      : '')
     +'<div class="dynbox" style="margin-top:8px">'
       +'<div class="dynhead">'
         +'<label class="chk"><input type="checkbox" id="p'+tid+'tp-active" onchange="dynToggle(\\'p'+tid+'tp\\')"><span>Dinamik TP</span></label>'
@@ -1802,7 +2150,7 @@ function dynBody(on){
   return '<div class="frow" style="margin-top:10px">'
     +'<div><label>Periyot</label><select id="'+on+'-tf">'
       +'<option value="5m">5m</option><option value="15m">15m</option><option value="30m">30m</option>'
-      +'<option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>'
+      +'<option value="1h">1h</option><option value="4h">4h</option><option value="1D">1D</option>'
     +'</select></div>'
     +'<div><label>Hard ile iliski</label><select id="'+on+'-mode" onchange="dynModeWarn(\\''+on+'\\')">'
       +'<option value="OR">VEYA - hangisi once gelirse</option>'
@@ -1916,6 +2264,18 @@ var CT={
   touch_price:{ad:'Fiyat degdi',p1:null,    p2:'Fiyat',  u2:'$', d1:null,d2:'',    op:'=', deg:1},
   touch_ema:{ad:'EMA degdi',    p1:null,    p2:'Periyot',u2:'',  d1:null,d2:30,    op:'=', deg:1}
 };
+
+/* Olay tipine gore renkli rozet */
+var OLAY_SINIF={
+  OPEN:'b-ok', CLOSE:'b-done', RULE_TRIGGER:'b-rule', SIGNAL_SKIP:'b-sig',
+  ERROR:'b-err', LEVEL:'b-test', EMERGENCY:'b-err', SETTINGS:'b-off',
+  WEBHOOK_REJECT:'b-err', SIZE_CLIP:'b-test', LEVEL_CHANGE:'b-done',
+  LEVEL_FAIL:'b-err', SL_SOFT:'b-err', TP_SOFT:'b-ok'
+};
+function olayRozet(k){
+  var s=OLAY_SINIF[k]||'b-off';
+  return '<span class="badge '+s+'">'+esc(k||'-')+'</span>';
+}
 
 function yonTxt(op){ return (op==='>'||op==='>=') ? 'uzeri' : 'alti'; }
 
@@ -2070,7 +2430,10 @@ function dynFill(on,cfg){
   box.innerHTML='';
   var aktif=!!(cfg&&cfg.active);
   act.checked=aktif;
-  document.getElementById(on+'-tf').value=(cfg&&cfg.timeframe)||'5m';
+  var tfd=(cfg&&cfg.timeframe)||'5m';
+  if(String(tfd).toLowerCase()==='1d')tfd='1D';
+  if(String(tfd).toLowerCase()==='1w')tfd='1W';
+  document.getElementById(on+'-tf').value=tfd;
   document.getElementById(on+'-mode').value=(cfg&&cfg.mode)||'OR';
   document.getElementById(on+'-logic').value=(cfg&&cfg.logic)||'AND';
   var cs=cfg&&cfg.conditions;
