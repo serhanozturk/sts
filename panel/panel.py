@@ -1514,18 +1514,18 @@ function render(){
   else if(age!==null){h.textContent='Executor sessiz ('+age+'s)';h.className='badge b-off';}
   else{h.textContent='Status yok';h.className='badge b-off';}
 
-  var lvl=(state.level||'RUN').toUpperCase();
+  var seviye=(state.level||'RUN').toUpperCase();
   var ls=document.getElementById('lvl-state');
-  ls.textContent=(state.emergency_pending?'ACIL CIKIS ISLENIYOR':(LVL_AD[lvl]||lvl));
-  ls.className='badge '+(state.emergency_pending?'b-live':(lvl==='RUN'?'b-ok':(lvl==='PAUSE'?'b-test':'b-off')));
+  ls.textContent=(state.emergency_pending?'ACIL CIKIS ISLENIYOR':(LVL_AD[seviye]||seviye));
+  ls.className='badge '+(state.emergency_pending?'b-live':(seviye==='RUN'?'b-ok':(seviye==='PAUSE'?'b-test':'b-off')));
 
-  document.getElementById('stop-banner').style.display=(lvl==='STOP')?'block':'none';
+  document.getElementById('stop-banner').style.display=(seviye==='STOP')?'block':'none';
 
   var bp=document.getElementById('btn-pause'), bs=document.getElementById('btn-stop');
-  bp.textContent=(lvl==='PAUSE')?'Devam et':'Duraklat';
-  bp.className=(lvl==='PAUSE')?'btn btn-go':'btn';
-  bs.textContent=(lvl==='STOP')?'Devam et':'Bot dur';
-  bs.className=(lvl==='STOP')?'btn btn-go':'btn btn-stop';
+  bp.textContent=(seviye==='PAUSE')?'Devam et':'Duraklat';
+  bp.className=(seviye==='PAUSE')?'btn btn-go':'btn';
+  bs.textContent=(seviye==='STOP')?'Devam et':'Bot dur';
+  bs.className=(seviye==='STOP')?'btn btn-go':'btn btn-stop';
 
   document.getElementById('m-bal').textContent=usd(st.balance,0);
   document.getElementById('m-sig').textContent=(st.sig_count!=null?st.sig_count:'—')+' / '+(st.sig_max||'—');
@@ -1667,8 +1667,8 @@ function fillSettings(){
   Object.keys(S_MAP).forEach(function(id){
     var el=document.getElementById(id);
     if(!el)return;
-    var v=st[S_MAP[id]];
-    el.value=(v===null||v===undefined)?'':v;
+    var deger=st[S_MAP[id]];
+    el.value=(deger===null||deger===undefined)?'':deger;
   });
   dynFill('stp',{active:st.dyn_tp_active,timeframe:st.dyn_tp_timeframe,
     mode:st.dyn_tp_mode,logic:st.dyn_tp_logic,conditions:st.dyn_tp_conditions});
@@ -1941,9 +1941,9 @@ function dynBadge(r,which){
   if(!r['dyn_'+which+'_active'])return '';
   var mode=(r['dyn_'+which+'_mode']||'OR').toUpperCase();
   var tf=r['dyn_'+which+'_timeframe']||'';
-  var cls=(mode==='AND')?'b-test':'b-rule';
+  var rozet=(mode==='AND')?'b-test':'b-rule';
   var ipucu=condText(r['dyn_'+which+'_conditions'], r['dyn_'+which+'_logic']);
-  return '<br><span class="badge '+cls+'" title="'+esc(tf+' | '+ipucu)+'">'
+  return '<br><span class="badge '+rozet+'" title="'+esc(tf+' | '+ipucu)+'">'
     +(mode==='AND'?'+VE ':'+VEYA ')+esc(tf)+'</span>';
 }
 
@@ -1985,6 +1985,7 @@ function condRow(c){
 }
 function fillRow(row,c,useDefaults){
   var t=row.querySelector('.c-type').value, def=CT[t];
+  if(!def){ def=CT['ema_cross']; }        // bilinmeyen tip: cokmek yerine varsayilan
   var p1=row.querySelector('.c-p1'), p2=row.querySelector('.c-p2');
   var w1=row.querySelector('.w1');
   var tek = def.p1===null;
