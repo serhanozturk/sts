@@ -103,11 +103,37 @@ def sb_patch(path, body):
         return False
 
 
-def set_killswitch(value):
+LEVELS = ("RUN", "PAUSE", "STOP")
+
+
+def set_level(level, note=None):
+    """Kill-switch seviyesi. killswitch alani geriye uyum icin birlikte guncellenir."""
+    level = (level or "").upper()
+    if level not in LEVELS:
+        return False
     return sb_patch("sts_control?id=eq.1", {
-        "killswitch": bool(value),
+        "level": level,
+        "killswitch": level != "RUN",
+        "level_at": datetime.now(timezone.utc).isoformat(),
+        "level_note": (note or "")[:200] or None,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     })
+
+
+def request_emergency():
+    """Acil cikis: executor tum pozisyonlari kapatir, sonra STOP'a geker."""
+    return sb_patch("sts_control?id=eq.1", {
+        "req_emergency": True,
+        "level_at": datetime.now(timezone.utc).isoformat(),
+        "level_note": "acil cikis istendi",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+def set_killswitch(value):
+    """Geriye uyum: eski /api/stop, /api/resume uclari icin."""
+    return set_level("PAUSE" if value else "RUN",
+                     "eski uc uzerinden" if value else None)
 
 
 def sb_post(path, body):
@@ -161,8 +187,9 @@ def sb_delete(path):
 # KURAL DOGRULAMA
 # ======================================================================
 
-COND_TYPES = {"ema_cross", "rsi", "price", "oi_change", "volume", "funding"}
-OPS = {"<", ">", "<=", ">="}
+COND_TYPES = {"ema_cross", "rsi", "price", "oi_change", "volume", "funding",
+              "touch_price", "touch_ema"}
+OPS = {"<", ">", "<=", ">=", "="}
 TIMEFRAMES = {"5m", "15m", "30m", "1h", "4h", "1d"}
 NEEDS_P1 = {"ema_cross", "oi_change", "volume"}   # rsi periyodu sabit 14
 
@@ -220,6 +247,12 @@ def validate_conditions(raw_conds, etiket=""):
             if p1 > 500:
                 err.append(f"{on}kosul {i}: periyot 500'den kucuk olmali")
                 continue
+        if t == "touch_ema" and (p2 <= 0 or p2 > 500):
+            err.append(f"{on}kosul {i}: ema periyodu 1-500 arasi olmali")
+            continue
+        if t == "touch_price" and p2 <= 0:
+            err.append(f"{on}kosul {i}: fiyat pozitif olmali")
+            continue
         if t == "ema_cross" and (p2 <= 0 or p2 > 500):
             err.append(f"{on}kosul {i}: yavas periyot 1-500 arasi olmali")
             continue
@@ -374,7 +407,11 @@ def gather_state():
             pass
 
     ctrl = sb_get("sts_control?id=eq.1&limit=1")
-    killswitch = bool(ctrl[0].get("killswitch")) if ctrl else False
+    c0 = ctrl[0] if ctrl else {}
+    killswitch = bool(c0.get("killswitch"))
+    level = (c0.get("level") or ("PAUSE" if killswitch else "RUN")).upper()
+    if level not in LEVELS:
+        level = "RUN"
 
     stg = sb_get("sts_settings?id=eq.1&limit=1")
     settings = stg[0] if stg else None
@@ -389,6 +426,9 @@ def gather_state():
         "status": status,
         "status_age": round(status_age) if status_age is not None else None,
         "killswitch": killswitch,
+        "level": level,
+        "emergency_pending": bool(c0.get("req_emergency")),
+        "level_at": c0.get("level_at"),
         "settings": settings,
         "webhooks": webhooks,
         "webhook_enabled": bool(WEBHOOK_TOKEN),
@@ -478,15 +518,24 @@ def validate_webhook(d):
     if not coin or len(coin) > 20:
         err.append("coin gecersiz")
 
+    eylem_ham = str(d.get("action") or "open").strip().lower()
     yon = str(d.get("direction") or d.get("side") or "").strip().upper()
     if yon in ("SELL", "SHORT"):
         yon = "SHORT"
     elif yon in ("BUY", "LONG"):
         yon = "LONG"
+    elif eylem_ham == "close":
+        yon = "SHORT"          # kapatmada yon kullanilmaz, kayit icin varsayilan
     else:
         err.append("direction SHORT/LONG (veya BUY/SELL) olmali")
 
+    eylem = str(d.get("action") or "open").strip().lower()
+    if eylem not in ("open", "close"):
+        err.append("action open veya close olmali")
+
     clean = {"coin": coin, "direction": yon}
+    if eylem == "close":
+        clean["action"] = "close"
 
     # opsiyonel sayisal alanlar
     for key, (caster, lo, hi) in WH_OPT_FIELDS.items():
@@ -789,6 +838,8 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
 .mini:hover{border-color:var(--text2);color:var(--text)}
 .mini.del:hover{border-color:var(--coralBd);color:var(--coral);background:var(--coralBg)}
 .divider{border-top:1px solid var(--border);padding-top:12px;margin-top:12px}
+.stopband{background:var(--coralBg);border:1px solid var(--coral);color:var(--coral);
+  border-radius:12px;padding:12px 16px;margin-bottom:12px;font-size:12px;line-height:1.6}
 .pospanel{background:var(--surface);border:1px solid var(--border);border-radius:12px;
   padding:14px 16px;margin:-4px 0 8px;box-shadow:var(--shadow);flex-basis:100%}
 .cprow{display:flex;gap:8px;align-items:stretch;margin-top:4px}
@@ -833,11 +884,19 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
     <span id="health" class="badge b-off">Baglaniyor</span>
   </div>
   <div class="hdr-r">
-    <span id="ks-state" class="badge b-off" style="display:none">Kill-switch</span>
+    <span id="lvl-state" class="badge b-ok">&mdash;</span>
     <button class="btn icon-btn" onclick="elleYenile(this)" id="refresh-btn" title="Yenile">&#8635;</button>
     <button class="btn icon-btn" onclick="toggleTheme()" id="theme-btn" title="Tema">&#9789;</button>
-    <button id="ks-btn" class="btn btn-stop" onclick="toggleKs()">Durdur</button>
+    <button id="btn-pause" class="btn" onclick="seviyeAyarla('PAUSE')" title="Yeni pozisyon acmayi durdur, izlemeye devam et">Duraklat</button>
+    <button id="btn-stop" class="btn btn-stop" onclick="seviyeAyarla('STOP')" title="Botu tamamen durdur">Bot dur</button>
+    <button id="btn-emg" class="btn btn-stop" onclick="acilCikis()" title="Tum pozisyonlari kapat ve dur">Acil cikis</button>
   </div>
+</div>
+
+<div id="stop-banner" class="stopband" style="display:none">
+  <b>BOT DURDURULDU</b> &mdash; Acik pozisyonlar IZLENMIYOR.
+  Yumusak TP/SL, dinamik cikis, webhook ve kural motoru calismiyor.
+  Hard TP/SL emirleri Binance'te duruyor (demo ortaminda guvenilmez).
 </div>
 
 <div class="tabs">
@@ -918,7 +977,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
         <div id="conds"></div>
         <div style="display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap">
           <button class="btn" style="font-size:11px;padding:6px 12px" onclick="addCond('conds')">+ Kosul ekle</button>
-          <span style="font-size:11px;color:var(--text3)">OI ve Hacim: son bar, onceki N barin ortalamasina gore karsilastirilir. Yonu operator belirler, eksi isareti gerekmez.</span>
+          <span style="font-size:11px;color:var(--text3)">OI ve Hacim: son bar, onceki N barin ortalamasina gore; yonu operator belirler, eksi isareti gerekmez. &nbsp;|&nbsp; DEGDI kosullari: kapanan mumun yuksek-dusuk araligi hedefe dokunduysa tetiklenir (fiyat geri donse bile), operator kullanilmaz.</span>
         </div>
       </div>
 
@@ -1230,12 +1289,16 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
           Bos biraktigin alanlar yukaridaki varsayilanlardan alinir.
         </p>
         <div class="frow">
+          <div><label>Islem</label><select id="g-action" onchange="uretJson()">
+            <option value="open">Pozisyon ac</option>
+            <option value="close">Pozisyonu kapat</option>
+          </select></div>
           <div><label>Coin</label><input id="g-coin" placeholder="{{ticker}}" oninput="uretJson()"></div>
-          <div><label>Yon</label><select id="g-dir" onchange="uretJson()">
+          <div id="g-dir-wrap"><label>Yon</label><select id="g-dir" onchange="uretJson()">
             <option value="SHORT">Short</option><option value="LONG">Long</option>
           </select></div>
         </div>
-        <div class="frow">
+        <div class="frow" id="g-detay">
           <div><label>TP tipi</label><select id="g-tptype" onchange="uretJson()">
             <option value="">Varsayilan</option><option value="pct">Yuzde</option><option value="price">Fiyat</option>
           </select></div>
@@ -1245,7 +1308,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
           </select></div>
           <div><label>SL degeri</label><input id="g-slval" placeholder="bos = varsayilan" oninput="uretJson()"></div>
         </div>
-        <div class="frow">
+        <div class="frow" id="g-detay2">
           <div><label>Teminat</label><div class="cunit"><input id="g-margin" placeholder="bos = varsayilan" style="padding-left:22px" oninput="uretJson()"><span class="u" style="left:10px;right:auto">$</span></div></div>
           <div><label>Kaldirac</label><div class="cunit"><input id="g-lev" placeholder="bos = varsayilan" oninput="uretJson()"><span class="u">x</span></div></div>
           <div><label>Not</label><input id="g-note" placeholder="opsiyonel" oninput="uretJson()"></div>
@@ -1267,6 +1330,12 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;
       <div class="cprow">
         <textarea id="wh-msg-long" rows="2" readonly class="mono"></textarea>
         <button class="btn" onclick="kopyala('wh-msg-long',this)">Kopyala</button>
+      </div>
+
+      <label style="margin-top:10px">Hazir mesaj &#8212; POZISYONU KAPAT</label>
+      <div class="cprow">
+        <textarea id="wh-msg-close" rows="2" readonly class="mono"></textarea>
+        <button class="btn" onclick="kopyala('wh-msg-close',this)">Kopyala</button>
       </div>
 
       <p style="font-size:11px;color:var(--text3);margin-top:8px">
@@ -1367,6 +1436,22 @@ function uretJson(){
   var tok=(state&&state.webhook_token)||'<WEBHOOK_TOKEN tanimli degil>';
   function v(id){ var el=document.getElementById(id); return el?el.value.trim():''; }
 
+  var eylem=v('g-action')||'open';
+  var kapat=(eylem==='close');
+
+  // kapatmada yon ve TP/SL/teminat alanlari gereksiz - gizle
+  var dw=document.getElementById('g-dir-wrap');
+  if(dw)dw.style.display=kapat?'none':'';
+  ['g-detay','g-detay2'].forEach(function(id){
+    var el=document.getElementById(id);
+    if(el)el.style.display=kapat?'none':'';
+  });
+
+  if(kapat){
+    out.value=JSON.stringify({token:tok, coin:(v('g-coin')||'{{ticker}}'), action:'close'});
+    return;
+  }
+
   var o={token:tok, coin:(v('g-coin')||'{{ticker}}'), direction:v('g-dir')||'SHORT'};
 
   var tpt=v('g-tptype'), tpv=v('g-tpval');
@@ -1429,13 +1514,18 @@ function render(){
   else if(age!==null){h.textContent='Executor sessiz ('+age+'s)';h.className='badge b-off';}
   else{h.textContent='Status yok';h.className='badge b-off';}
 
-  var ks=state.killswitch;
-  var kss=document.getElementById('ks-state');
-  kss.style.display=ks?'':'none';
-  kss.textContent='Kill-switch aktif';
-  var kb=document.getElementById('ks-btn');
-  kb.textContent=ks?'Devam et':'Durdur';
-  kb.className=ks?'btn btn-go':'btn btn-stop';
+  var lvl=(state.level||'RUN').toUpperCase();
+  var ls=document.getElementById('lvl-state');
+  ls.textContent=(state.emergency_pending?'ACIL CIKIS ISLENIYOR':(LVL_AD[lvl]||lvl));
+  ls.className='badge '+(state.emergency_pending?'b-live':(lvl==='RUN'?'b-ok':(lvl==='PAUSE'?'b-test':'b-off')));
+
+  document.getElementById('stop-banner').style.display=(lvl==='STOP')?'block':'none';
+
+  var bp=document.getElementById('btn-pause'), bs=document.getElementById('btn-stop');
+  bp.textContent=(lvl==='PAUSE')?'Devam et':'Duraklat';
+  bp.className=(lvl==='PAUSE')?'btn btn-go':'btn';
+  bs.textContent=(lvl==='STOP')?'Devam et':'Bot dur';
+  bs.className=(lvl==='STOP')?'btn btn-go':'btn btn-stop';
 
   document.getElementById('m-bal').textContent=usd(st.balance,0);
   document.getElementById('m-sig').textContent=(st.sig_count!=null?st.sig_count:'—')+' / '+(st.sig_max||'—');
@@ -1467,10 +1557,10 @@ function render(){
         +'<div class="pos-nm"><b>'+esc(p.coin)+'</b>'
         +'<span class="badge '+(p.side==='LONG'?'b-long':'b-short')+'">'+esc(p.side||'')+'</span>'
         +'<span class="badge '+(p.source==='rule'?'b-rule':'b-sig')+'">'+(p.source==='rule'?'Kural':'Sinyal')+'</span></div>'
-        +'<div class="pos-dt mono"><span>Giris</span> '+fmt(p.entry,6)
-        +' &nbsp;<span>Mark</span> <b id="mark-'+tid+'" style="font-weight:400">'+fmt(p.mark,6)+'</b>'
-        +' &nbsp;<span>TP</span> '+fmt(p.tp,6)
-        +' &nbsp;<span>SL</span> '+fmt(p.sl,6)
+        +'<div class="pos-dt mono"><span>Giris</span> '+fiyat(p.entry)
+        +' &nbsp;<span>Mark</span> <b id="mark-'+tid+'" style="font-weight:400">'+fiyat(p.mark)+'</b>'
+        +' &nbsp;<span>TP</span> '+fiyat(p.tp)
+        +' &nbsp;<span>SL</span> '+fiyat(p.sl)
         +' &nbsp;<span>'+(p.leverage||'—')+'x</span>'
         +(m?' &nbsp;<span>'+usd(m,0)+'</span>':'')
         +'</div></div>'
@@ -1506,8 +1596,8 @@ function render(){
     return '<tr><td><b>'+esc(t.coin)+'</b></td>'
       +'<td><span class="badge '+(t.side==='LONG'?'b-long':'b-short')+'">'+esc(t.side||'')+'</span></td>'
       +'<td><span class="badge '+(t.source==='rule'?'b-rule':'b-sig')+'">'+(t.source==='rule'?'Kural':'Sinyal')+'</span></td>'
-      +'<td class="mono">'+fmt(t.entry_price,6)+'</td>'
-      +'<td class="mono">'+(t.closed_at?fmt(t.exit_price,6):'<span class="mut">Acik</span>')+'</td>'
+      +'<td class="mono">'+fiyat(t.entry_price)+'</td>'
+      +'<td class="mono">'+(t.closed_at?fiyat(t.exit_price):'<span class="mut">Acik</span>')+'</td>'
       +'<td class="mono '+cls(p)+'"><b>'+(p===null?'—':sgn(p))+'</b>'
         +(pct!==null?'<br><span style="font-size:10px">'+pctTxt(pct)+'</span>':'')+'</td>'
       +'<td>'+esc(t.exit_reason||'—')+'</td>'
@@ -1597,6 +1687,8 @@ function fillSettings(){
     '{"token":"'+tok+'","coin":"{{ticker}}","direction":"SHORT"}';
   document.getElementById('wh-msg-long').value=
     '{"token":"'+tok+'","coin":"{{ticker}}","direction":"LONG"}';
+  document.getElementById('wh-msg-close').value=
+    '{"token":"'+tok+'","coin":"{{ticker}}","action":"close"}';
   uretJson();
   settingsDirty=false;
   document.getElementById('s-errors').style.display='none';
@@ -1741,7 +1833,7 @@ function guncellePnl(pos){
     var el2=document.getElementById('pnlp-'+tid);
     if(el2&&pct!==null){ el2.textContent=pctTxt(pct); el2.className='pnl-pct '+cls(pct); }
     var el3=document.getElementById('mark-'+tid);
-    if(el3){ el3.textContent=fmt(p.mark,6); }
+    if(el3){ el3.textContent=fiyat(p.mark); }
   });
 }
 
@@ -1780,10 +1872,18 @@ function hidePos(tid){
 }
 function savePos(tid){
   var body=Object.assign({},
-    dynRead('p'+tid+'tp','dyn_tp'), dynRead('p'+tid+'sl','dyn_sl'),
-    {tp_price:document.getElementById('pp-tp-'+tid).value,
-     sl_price:document.getElementById('pp-sl-'+tid).value});
-  gonderPos(tid, body, 'Istek gonderildi - executor 20sn icinde uygular');
+    dynRead('p'+tid+'tp','dyn_tp'), dynRead('p'+tid+'sl','dyn_sl'));
+  // Hard TP/SL: SADECE degistiyse gonder. Aksi halde executor bosuna
+  // Binance emirlerini iptal/yeniden kurmaya calisir (demo'da -4130 hatasi).
+  var t=(state.trades||[]).filter(function(x){return x.id===tid})[0]||{};
+  var yeniTp=document.getElementById('pp-tp-'+tid).value.trim();
+  var yeniSl=document.getElementById('pp-sl-'+tid).value.trim();
+  if(yeniTp!=='' && Number(yeniTp)!==Number(t.tp_price)) body.tp_price=yeniTp;
+  if(yeniSl!=='' && Number(yeniSl)!==Number(t.sl_price)) body.sl_price=yeniSl;
+  var mesaj = (body.tp_price!==undefined||body.sl_price!==undefined)
+    ? 'Istek gonderildi - executor 20sn icinde uygular'
+    : 'Dinamik cikis kaydedildi';
+  gonderPos(tid, body, mesaj);
 }
 function closePos(tid){
   var t=(state.trades||[]).filter(function(x){return x.id===tid})[0]||{};
@@ -1812,7 +1912,9 @@ var CT={
   price:    {ad:'Fiyat',        p1:null,    p2:'Fiyat',  u2:'$', d1:null,d2:'',    op:'<'},
   oi_change:{ad:'OI degisimi',  p1:'Onceki bar', p2:'Fark', u2:'%', d1:3, d2:5,   op:'>'},
   volume:   {ad:'Hacim',        p1:'Onceki bar', p2:'Fark', u2:'%', d1:3, d2:5,   op:'>'},
-  funding:  {ad:'Funding',      p1:null,    p2:'Oran',   u2:'%', d1:null,d2:-0.05, op:'<'}
+  funding:  {ad:'Funding',      p1:null,    p2:'Oran',   u2:'%', d1:null,d2:-0.05, op:'<'},
+  touch_price:{ad:'Fiyat degdi',p1:null,    p2:'Fiyat',  u2:'$', d1:null,d2:'',    op:'=', deg:1},
+  touch_ema:{ad:'EMA degdi',    p1:null,    p2:'Periyot',u2:'',  d1:null,d2:30,    op:'=', deg:1}
 };
 
 function yonTxt(op){ return (op==='>'||op==='>=') ? 'uzeri' : 'alti'; }
@@ -1827,6 +1929,8 @@ function condText(conds,logic){
     if(t==='oi_change')return 'OI: '+c.p1+' bar ort. '+yonTxt(c.op)+' %'+Math.abs(c.p2);
     if(t==='volume')return 'Hacim: '+c.p1+' bar ort. '+yonTxt(c.op)+' %'+Math.abs(c.p2);
     if(t==='funding')return 'Funding '+c.op+' '+c.p2+'%';
+    if(t==='touch_price')return 'Fiyat $'+c.p2+' seviyesine DEGDI';
+    if(t==='touch_ema')return 'Fiyat EMA'+c.p2+' seviyesine DEGDI';
     if(t==='price')return 'Fiyat '+c.op+' $'+c.p2;
     return t+' '+c.op+' '+c.p2;
   });
@@ -1843,9 +1947,17 @@ function dynBadge(r,which){
     +(mode==='AND'?'+VE ':'+VEYA ')+esc(tf)+'</span>';
 }
 
+/* Fiyat buyuklugune gore ondalik: >=100 -> 2, >=1 -> 4, <1 -> 6 */
+function fiyat(v){
+  var x=n(v); if(x===null)return '—';
+  var a=Math.abs(x);
+  var d = a>=100 ? 2 : (a>=1 ? 4 : 6);
+  return x.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
+}
+
 function lvl(type,val){
   if(val==null)return '—';
-  return type==='pct'?(fmt(val,2)+'%'):('$'+fmt(val,8));
+  return type==='pct'?(fmt(val,2)+'%'):('$'+fiyat(val));
 }
 function syncLevelUnits(){
   document.getElementById('u-tp').textContent=
@@ -1861,7 +1973,7 @@ function condRow(c){
   var opts=Object.keys(CT).map(function(k){
     return '<option value="'+k+'"'+(k===t?' selected':'')+'>'+CT[k].ad+'</option>';
   }).join('');
-  var ops=['<','>','<=','>='].map(function(o){
+  var ops=['<','>','<=','>=','='].map(function(o){
     return '<option value="'+o+'"'+((c&&c.op===o)?' selected':'')+'>'+o+'</option>';
   }).join('');
   d.innerHTML='<select class="c-type" onchange="onTypeChange(this)">'+opts+'</select>'
@@ -1876,6 +1988,10 @@ function fillRow(row,c,useDefaults){
   var p1=row.querySelector('.c-p1'), p2=row.querySelector('.c-p2');
   var w1=row.querySelector('.w1');
   var tek = def.p1===null;
+  // Degme kosullarinda operator anlamsiz: bar araligi hedefe dokundu mu
+  var opSel=row.querySelector('.c-op');
+  if(def.deg){ opSel.style.visibility='hidden'; opSel.value='='; }
+  else { opSel.style.visibility=''; if(opSel.value==='=')opSel.value=def.op||'<'; }
   row.classList.toggle('single', tek);
   w1.style.display = tek?'none':'';
   row.querySelector('.u2').textContent=def.u2||'';
@@ -2093,12 +2209,46 @@ function delRule(id){
 }
 
 /* ---------- kill-switch ---------- */
-function toggleKs(){
-  var ks=state&&state.killswitch;
-  var action=ks?'/api/resume':'/api/stop';
-  var msg=ks?'Bot devam etsin mi?':'Yeni pozisyon acma DURDURULSUN mu?\\n(Acik pozisyonlar izlenmeye devam eder)';
-  if(!confirm(msg))return;
-  fetch(action,{method:'POST'}).then(function(){toast(ks?'Devam ediliyor':'Durduruldu');refresh();});
+var LVL_AD={RUN:'Calisiyor', PAUSE:'Duraklatildi', STOP:'DURDURULDU'};
+
+function seviyeAyarla(hedef){
+  var su=(state&&state.level)||'RUN';
+  if(hedef===su){
+    if(!confirm('Bot normal moda dondurulsun mu?'))return;
+    hedef='RUN';
+  }else if(hedef==='PAUSE'){
+    if(!confirm('DURAKLAT\\n\\nYeni pozisyon acilmayacak.\\n'
+      +'Acik pozisyonlar izlenmeye ve TP/SL ile kapanmaya DEVAM eder.\\n\\nOnayliyor musun?'))return;
+  }else if(hedef==='STOP'){
+    if(!confirm('BOT DUR\\n\\nHer sey durur: yumusak TP/SL, dinamik cikis, webhook, kural motoru.\\n'
+      +'ACIK POZISYONLAR IZLENMEYECEK.\\n'
+      +'Hard TP/SL emirleri borsada kalir (demo ortaminda guvenilmez).\\n\\nOnayliyor musun?'))return;
+  }
+  fetch('/api/level',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({level:hedef})})
+    .then(function(r){return r.json()})
+    .then(function(j){ toast(j.ok?('Seviye: '+(LVL_AD[hedef]||hedef)):'Degistirilemedi'); refresh(); })
+    .catch(function(){ toast('Baglanti hatasi'); });
+}
+
+function acilCikis(){
+  var pos=(state&&state.status&&state.status.positions)||[];
+  var toplam=0;
+  pos.forEach(function(p){ if(p.upnl!=null) toplam+=Number(p.upnl); });
+  if(!pos.length){
+    if(!confirm('Acik pozisyon yok.\\nYine de botu DURDURMAK istiyor musun?'))return;
+    seviyeAyarla('STOP');
+    return;
+  }
+  var liste=pos.map(function(p){return '  - '+p.coin+' '+p.side+' ('+sgn(p.upnl)+')'}).join('\\n');
+  if(!confirm('ACIL CIKIS\\n\\n'+pos.length+' pozisyon MARKET emriyle kapatilacak:\\n'
+    +liste+'\\n\\nToplam PnL: '+sgn(toplam)+'\\n\\nBu islem GERI ALINAMAZ. Devam?'))return;
+  if(!confirm('SON ONAY\\n\\n'+pos.length+' pozisyon simdi kapatilacak ve bot durdurulacak.\\n'
+    +'Emin misin?'))return;
+  fetch('/api/emergency',{method:'POST'})
+    .then(function(r){return r.json()})
+    .then(function(j){ toast(j.ok?'Acil cikis gonderildi':'Gonderilemedi'); refresh(); })
+    .catch(function(){ toast('Baglanti hatasi'); });
 }
 
 /* ---------- yenileme ---------- */
@@ -2274,6 +2424,22 @@ class Handler(BaseHTTPRequestHandler):
             ok = set_killswitch(False)
             log("Kill-switch KALDIRILDI (panel)")
             self._send(200 if ok else 500, json.dumps({"ok": ok, "killswitch": False}))
+        elif self.path == "/api/level":
+            d = self._body() or {}
+            seviye = (d.get("level") or "").upper()
+            if seviye not in LEVELS:
+                self._send(400, json.dumps({"ok": False,
+                           "errors": [f"seviye RUN/PAUSE/STOP olmali"]}))
+                return
+            ok = set_level(seviye, d.get("note"))
+            log(f"Seviye istegi: {seviye}")
+            self._send(200 if ok else 500, json.dumps({"ok": ok, "level": seviye}))
+            return
+        elif self.path == "/api/emergency":
+            ok = request_emergency()
+            log("ACIL CIKIS istegi gonderildi", "WARN")
+            self._send(200 if ok else 500, json.dumps({"ok": ok}))
+            return
         elif self.path == "/api/rules/import":
             # JSON yapistirma: tek kural veya kural listesi
             d = self._body()
