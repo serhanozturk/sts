@@ -349,6 +349,11 @@ def sb_get_control():
     return None
 
 
+def sb_set_control(fields):
+    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return sb_request("PATCH", "sts_control?id=eq.1", fields)
+
+
 def sb_get_settings():
     """sts_settings tablosundan strateji ayarlarini oku (tek satir, id=1)."""
     rows = sb_request("GET", "sts_settings?id=eq.1&limit=1")
@@ -879,6 +884,8 @@ def required_bars(conditions):
             need = max(need, (p1 if p1 > 0 else 14) * 5)
         elif t == "volume":
             need = max(need, p1 + 3)
+        elif t == "touch_ema":
+            need = max(need, int(num(c.get("p2"), 0) or 0) * 5)
     return min(need, 1500)
 
 
@@ -940,6 +947,25 @@ def eval_conditions(rule, ctx):
             note = (f"hacim son {int(p1 or 3)} bar ort. gore="
                     f"{chg if chg is None else round(chg,2)}% "
                     f"(esik %{p2} {yon}) -> {ok}")
+        elif t == "touch_price":
+            # Kapanan barin araligi hedef seviyeye DEGDI mi (yon fark etmez)
+            yuksek, dusuk = ctx.get("last_high"), ctx.get("last_low")
+            hedef = p2
+            if yuksek is None or dusuk is None or hedef is None:
+                note = "degme: bar verisi yok"
+            else:
+                ok = dusuk <= hedef <= yuksek
+                note = (f"bar [{dusuk}-{yuksek}] fiyat {hedef} degdi mi -> {ok}")
+        elif t == "touch_ema":
+            # Bar araligi EMA(p2) seviyesine degdi mi
+            yuksek, dusuk = ctx.get("last_high"), ctx.get("last_low")
+            per = int(p2) if p2 else 0
+            e = ema(ctx.get("closes") or [], per) if per else None
+            if yuksek is None or dusuk is None or e is None:
+                note = f"degme: ema{per} hesaplanamadi"
+            else:
+                ok = dusuk <= e <= yuksek
+                note = f"bar [{dusuk}-{yuksek}] ema{per}={e:.6g} degdi mi -> {ok}"
         elif t == "funding":
             f = ctx.get("funding_pct")
             ok = compare(f, op, p2)
@@ -973,6 +999,8 @@ class Bot:
         self.settings_warned = False
         self.settings_row = None     # sinyal havuzu dinamik cikis yapilandirmasi
         self.webhook_checked_at = 0
+        self.level = "RUN"
+        self.emergency = False
         self.rule_last_bar = {}      # rule_id -> son degerlendirilen bar id
         self.dyn_last_bar = {}       # (trade_id, dyn_tp|dyn_sl) -> son bar id
         self.kline_cache = {}        # (sym, tf) -> (bar_id, ohlcv)
@@ -988,13 +1016,96 @@ class Bot:
             log(f"Restart: {len(self.open_trades)} acik islem geri yuklendi")
 
     def refresh_control(self):
-        """Kill-switch + last_signal_id Supabase'den. Dosya flag'i yerel yedek."""
+        """Seviye + acil cikis bayragi + last_signal_id Supabase'den.
+        Yerel bot_stop.flag dosyasi acil yedek olarak PAUSE etkisi yapar."""
         ctrl = sb_get_control()
-        ks_db = bool(ctrl.get("killswitch")) if ctrl else False
-        self.killswitch = ks_db or os.path.exists(STOP_FLAG)
-        if ctrl and self.last_signal_id is None and ctrl.get("last_signal_id") is not None:
-            self.last_signal_id = int(ctrl["last_signal_id"])
+        seviye = "RUN"
+        if ctrl:
+            seviye = (ctrl.get("level") or "RUN").upper()
+            if seviye not in ("RUN", "PAUSE", "STOP"):
+                seviye = "RUN"
+            # geriye uyum: eski killswitch alani doluysa en az PAUSE
+            if ctrl.get("killswitch") and seviye == "RUN":
+                seviye = "PAUSE"
+            self.emergency = bool(ctrl.get("req_emergency"))
+            if self.last_signal_id is None and ctrl.get("last_signal_id") is not None:
+                self.last_signal_id = int(ctrl["last_signal_id"])
+        if os.path.exists(STOP_FLAG) and seviye == "RUN":
+            seviye = "PAUSE"
+
+        if seviye != self.level:
+            log(f"Seviye degisti: {self.level} -> {seviye}")
+            sb_log_event("LEVEL", None, f"{self.level} -> {seviye}")
+            if seviye == "STOP":
+                tg_send("<b>BOT DURDURULDU</b>\nAcik pozisyonlar IZLENMIYOR. "
+                        "Hard TP/SL emirleri Binance'te kaliyor.")
+            elif seviye == "PAUSE":
+                tg_send("<b>DURAKLATILDI</b>\nYeni pozisyon acilmayacak. "
+                        "Acik pozisyonlar izlenmeye devam ediyor.")
+            else:
+                tg_send("<b>BOT CALISIYOR</b>\nNormal moda dondu.")
+            self.level = seviye
+        # geriye uyumluluk: eski kodun bektigi bayrak
+        self.killswitch = self.level != "RUN"
         return ctrl
+
+    # ------------------------------------------------------------------
+    # ACIL CIKIS
+    # ------------------------------------------------------------------
+    def run_emergency(self, live):
+        """Tum pozisyonlari market ile kapat, sonra STOP'a gec."""
+        if not self.emergency:
+            return
+        self.emergency = False
+        log("ACIL CIKIS istegi alindi - tum pozisyonlar kapatiliyor", "WARN")
+        sb_log_event("EMERGENCY", None, "acil cikis basladi")
+
+        if live is None:
+            live = self.ex.open_positions()
+        kapatilan, basarisiz = [], []
+
+        for sym in list((live or {}).keys()):
+            trade = self.open_trades.get(sym) or {}
+            coin = trade.get("coin") or sym.split("/")[0]
+            pos = (live or {}).get(sym) or {}
+            side = (pos.get("side") or trade.get("side") or "SHORT").upper()
+            amount = float(pos.get("contracts") or trade.get("amount") or 0)
+            if amount <= 0:
+                continue
+            self.ex.cancel_all(sym)
+            res = self.ex.close_market(sym, side, amount)
+            if not res:
+                basarisiz.append(coin)
+                log(f"{coin} acil kapatma BASARISIZ", "ERROR")
+                continue
+            cikis = None
+            try:
+                cikis = res.get("average") or res.get("price")
+            except Exception:
+                pass
+            if not cikis:
+                cikis = self.ex.last_price(sym)
+            entry = float(trade.get("entry_price") or 0)
+            pnl = None
+            if entry and cikis:
+                pnl = round((entry - float(cikis)) * amount, 4) if side == "SHORT" \
+                    else round((float(cikis) - entry) * amount, 4)
+            if trade.get("id"):
+                sb_close_trade(trade["id"], cikis, pnl, "EMERGENCY")
+            self.open_trades.pop(sym, None)
+            kapatilan.append(f"{coin} {'' if pnl is None else format(pnl, '+.2f')}")
+
+        sb_set_control({"req_emergency": False, "level": "STOP",
+                        "level_at": datetime.now(timezone.utc).isoformat(),
+                        "level_note": "acil cikis sonrasi"})
+        self.level = "STOP"
+        self.killswitch = True
+
+        ozet = ", ".join(kapatilan) if kapatilan else "kapatilacak pozisyon yoktu"
+        hata = f"\nKAPATILAMAYAN: {', '.join(basarisiz)}" if basarisiz else ""
+        log(f"ACIL CIKIS tamamlandi: {ozet}{hata}")
+        sb_log_event("EMERGENCY", None, f"tamamlandi: {ozet}{hata}")
+        tg_send(f"<b>ACIL CIKIS TAMAMLANDI</b>\n{ozet}{hata}\nBot DURDURULDU.")
 
     def refresh_settings(self, force=False):
         """Strateji ayarlarini Supabase'den oku (SETTINGS_POLL_SEC araligiyla).
@@ -1077,18 +1188,31 @@ class Bot:
             try:
                 self.refresh_control()
                 self.refresh_settings()
-                live = self.check_closed_positions()
-                self.write_status(live)
-                self.process_position_requests(live)
-                self.monitor_soft_exits(live)
-                self.monitor_dynamic_exits(live)
-                self.refresh_rules()
-                if self.stopped():
-                    log("KILL-SWITCH aktif - yeni pozisyon acilmiyor", "WARN")
+
+                # ACIL CIKIS her seviyede calisir (STOP'ta da istenebilir)
+                if self.emergency:
+                    live = self.ex.open_positions()
+                    self.write_status(live)
+                    self.run_emergency(live)
+                    live = self.check_closed_positions()
+                    self.write_status(live)
+                elif self.level == "STOP":
+                    # Her sey durur; sadece durum yazilir ki panel executor'u gorsun
+                    live = self.ex.open_positions()
+                    self.write_status(live)
                 else:
-                    self.process_signals()
-                    self.process_rules()
-                    self.process_webhooks()
+                    live = self.check_closed_positions()
+                    self.write_status(live)
+                    self.process_position_requests(live)
+                    self.monitor_soft_exits(live)
+                    self.monitor_dynamic_exits(live)
+                    self.refresh_rules()
+                    if self.level == "PAUSE":
+                        pass          # izleme devam, yeni pozisyon yok
+                    else:
+                        self.process_signals()
+                        self.process_rules()
+                        self.process_webhooks()
             except Exception as e:
                 log(f"Dongu hatasi: {e}", "ERROR")
                 sb_log_event("ERROR", None, f"dongu: {e}")
@@ -1142,6 +1266,7 @@ class Bot:
             "version": VERSION,
             "testnet": TESTNET,
             "killswitch": self.stopped(),
+            "level": self.level,
             "balance": balance,
             "sig_count": sig_count, "sig_max": CFG["max_positions"],
             "rule_count": rule_count, "rule_max": CFG["max_rule_positions"],
@@ -1165,8 +1290,11 @@ class Bot:
                 continue
         if exit_price is None:
             exit_price = self.ex.last_price(symbol)
-            if reason == "UNKNOWN":
-                reason = "MANUEL/BILINMIYOR"
+
+        # Demo'da emirler API'de gorunmedigi icin (-2013) sebep tespit edilemez.
+        # Cikis fiyatini TP/SL seviyeleriyle karsilastirarak cikar.
+        if reason == "UNKNOWN":
+            reason = self._sebep_fiyattan(trade, exit_price)
 
         entry = float(trade.get("entry_price") or 0)
         amount = float(trade.get("amount") or 0)
@@ -1195,7 +1323,8 @@ class Bot:
         ctx = {}
         cond_types = {(c.get("type") or "").lower() for c in conds}
 
-        need_kline = cond_types & {"ema_cross", "rsi", "price", "volume"}
+        need_kline = cond_types & {"ema_cross", "rsi", "price", "volume",
+                                   "touch_price", "touch_ema"}
         if need_kline:
             bars = required_bars(conds)
             cache_key = (symbol, tf)
@@ -1211,6 +1340,9 @@ class Bot:
             closed = ohlcv[:-1]                # son eleman canli mum
             ctx["closes"] = [c[4] for c in closed]
             ctx["last_close"] = closed[-1][4]
+            # DEGME kosullari icin kapanan barin aralig
+            ctx["last_high"] = closed[-1][2]
+            ctx["last_low"] = closed[-1][3]
             vols = [c[5] for c in closed]
             for c in conds:
                 if (c.get("type") or "").lower() == "volume":
@@ -1737,6 +1869,35 @@ class Bot:
         tg_send(f"<b>{sebep}</b> {coin} {side}\nCikis: {cikis}\nPnL: <b>{pnl_txt}</b>\n{aciklama}")
         return True
 
+    @staticmethod
+    def _sebep_fiyattan(trade, exit_price, tolerans=0.004):
+        """Cikis fiyatini TP/SL seviyeleriyle karsilastirip sebebi cikar.
+        tolerans: orana gore yakinlik (0.004 = %0.4). Ikisine de uzaksa BILINMIYOR."""
+        try:
+            cikis = float(exit_price) if exit_price else None
+        except (TypeError, ValueError):
+            cikis = None
+        if not cikis:
+            return "MANUEL/BILINMIYOR"
+
+        adaylar = []
+        for anahtar, etiket in (("tp_price", "TP"), ("sl_price", "SL")):
+            try:
+                seviye = float(trade.get(anahtar) or 0)
+            except (TypeError, ValueError):
+                seviye = 0
+            if seviye > 0:
+                fark = abs(cikis - seviye) / seviye
+                adaylar.append((fark, etiket))
+        if not adaylar:
+            return "MANUEL/BILINMIYOR"
+
+        adaylar.sort()
+        fark, etiket = adaylar[0]
+        if fark <= tolerans:
+            return etiket
+        return "MANUEL/BILINMIYOR"
+
     # ------------------------------------------------------------------
     # HAVUZ 1 - SINYAL
     # ------------------------------------------------------------------
@@ -2003,13 +2164,71 @@ class Bot:
                     payload = json.loads(payload)
                 except Exception:
                     payload = {}
+            eylem = (payload.get("action") or "open").strip().lower()
             try:
-                sonuc = self.handle_webhook(wid, coin, yon, payload)
+                if eylem == "close":
+                    sonuc = self.handle_webhook_close(wid, coin)
+                else:
+                    sonuc = self.handle_webhook(wid, coin, yon, payload)
             except Exception as e:
                 log(f"Webhook #{wid} ({coin}) hata: {e}", "ERROR")
                 sb_log_event("ERROR", coin, f"webhook #{wid}: {e}")
                 sonuc = f"ERROR:{e}"
             sb_mark_webhook(wid, sonuc)
+
+    def handle_webhook_close(self, wid, coin):
+        """Webhook ile pozisyon kapatma (action=close)."""
+        log(f"Webhook #{wid}: {coin} KAPATMA")
+        symbol = self.ex.unified(coin)
+        if not symbol:
+            sb_log_event("SIGNAL_SKIP", coin, f"webhook #{wid}: coin binance futures'ta yok")
+            return "SKIPPED:coin yok"
+
+        live = self.ex.open_positions()
+        if live is None:
+            return "SKIPPED:pozisyonlar okunamadi"
+        if symbol not in live:
+            sb_log_event("SIGNAL_SKIP", coin, f"webhook #{wid}: acik pozisyon yok")
+            return "SKIPPED:acik pozisyon yok"
+
+        pos = live[symbol]
+        trade = self.open_trades.get(symbol) or {}
+        side = (pos.get("side") or trade.get("side") or "SHORT").upper()
+        amount = float(pos.get("contracts") or trade.get("amount") or 0)
+        if amount <= 0:
+            return "SKIPPED:miktar okunamadi"
+
+        self.ex.cancel_all(symbol)
+        res = self.ex.close_market(symbol, side, amount)
+        if not res:
+            sb_log_event("ERROR", coin, f"webhook #{wid}: kapatma emri basarisiz")
+            tg_send(f"<b>UYARI</b> {coin}\nWebhook kapatma emri basarisiz.")
+            return "ERROR:kapatma basarisiz"
+
+        cikis = None
+        try:
+            cikis = res.get("average") or res.get("price")
+        except Exception:
+            pass
+        if not cikis:
+            cikis = self.ex.last_price(symbol)
+
+        entry = float(trade.get("entry_price") or 0)
+        pnl = None
+        if entry and cikis:
+            pnl = round((entry - float(cikis)) * amount, 4) if side == "SHORT" \
+                else round((float(cikis) - entry) * amount, 4)
+
+        if trade.get("id"):
+            sb_close_trade(trade["id"], cikis, pnl, "WEBHOOK_CLOSE")
+        self.open_trades.pop(symbol, None)
+
+        pnl_txt = f"{pnl:+.2f} USDT" if pnl is not None else "?"
+        log(f"WEBHOOK_CLOSE {coin} {side} | cikis {cikis} | PnL {pnl_txt}")
+        sb_log_event("CLOSE", coin, f"{side} WEBHOOK_CLOSE cikis={cikis} pnl={pnl}")
+        tg_send(f"<b>WEBHOOK ILE KAPATILDI</b> {coin} {side}\n"
+                f"Cikis: {cikis}\nPnL: <b>{pnl_txt}</b>")
+        return "CLOSED"
 
     def handle_webhook(self, wid, coin, yon, payload):
         """Tek webhook sinyalini degerlendir. Doner: sonuc metni."""
