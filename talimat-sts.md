@@ -23,10 +23,14 @@ STS sadece Supabase uzerinden Screener ile konusur (`screener_signals` tablosunu
 
 ## 2. MIMARI — IKI AYRI SERVIS
 
-| Servis | Dosya | Coolify app | Port | Binance key |
+| Servis | Dosya | Coolify app | Surum | Binance key |
 |---|---|---|---|---|
-| Executor | `bot/bot.py` | **stsexecutor** | yok | VAR (emirleri o acar) |
-| Panel | `panel/panel.py` | **stspanel** | 8080 (host 8090) | YOK |
+| Executor | `bot/bot.py` | **stsexecutor** | v3.0 | VAR (emirleri o acar) |
+| Panel | `panel/panel.py` | **stspanel** | v3.0 | YOK |
+
+Dogrulama scripti: `panel/dogrula.py` — CSS kapsama, JS butunlugu,
+`render()` gercek calistirma ve backend kontrolleri (42 kontrol).
+Panel uzerinde degisiklik yaptiktan sonra `python3 dogrula.py` kosulur.
 
 **Panel Binance key'i GORMEZ.** Panel istek yazar, executor uygular.
 Bu ayrim bilincli bir guvenlik karari — bozma.
@@ -255,6 +259,17 @@ ve **sessizce bos sonuc** doner. `iso_url()` yardimcisini kullan (`Z` formati).
 ### TUZAK 4 — fail-open
 Kontrol sorgusu basarisiz olursa **korumayi kapatma**. Dedup sorgusu hata verirse
 sinyal ATLANIR, acilmaz. Ayni mantik tum guvenlik kontrolleri icin gecerli.
+
+### SURUM NUMARASI — her degisiklikte artir
+`bot.py` ve `panel.py` basindaki `VERSION` sabiti **her kod degisikliginde**
+artirilir ve hemen altindaki **SURUM GECMISI** yorumuna tek satir not eklenir.
+
+- Ikisi ayni numarada tutulur (`v3.0`, `v3.1`, ...) — boylece hangi panelin
+  hangi executor ile eslestigi belli olur
+- Kucuk duzeltme -> minor artir (v3.0 -> v3.1); mimari degisiklik -> major
+- Panel basliginda surum rozeti var: ikisi ayni ise tek numara gosterir,
+  **farkli ise turuncu uyari** cikar (biri deploy edilmemis demektir)
+- Deploy sonrasi rozete bak: uyusmazlik varsa eksik tarafi deploy et
 
 ### Talimat dosyasi guncel tutulur
 Mimari, tablo, strateji parametresi, cikis katmani veya yeni bir tuzak ortaya
