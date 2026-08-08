@@ -52,7 +52,7 @@ ACIKCA yaz. Bir tarafi deploy edip digerini unutmak en sik yasanan hata.
 | `sts_rules` | panel | Ozel kurallar |
 | `sts_events` | ikisi | Olay akisi (atlama, hata, tetiklenme) |
 | `sts_status` | executor | Panel icin durum snapshot'i (id=1, tek satir) |
-| `sts_control` | panel | Kill-switch + `last_signal_id` (id=1) |
+| `sts_control` | panel | Seviye (`level`), acil cikis bayragi, `last_signal_id` (id=1) |
 | `sts_settings` | panel | Strateji ayarlari (id=1) |
 | `sts_webhooks` | panel | TradingView webhook kuyrugu |
 
@@ -115,6 +115,11 @@ Iki ayri blok, her biri kendi periyoduyla. Hard ile iliskisi:
 
 AND modundaki tarafta yumusak katman **atlanir** (seviyeye ulasmak tek basina yetmez).
 
+**Kapanis sebebi tespiti:** Demo'da emirler API'de gorunmedigi icin (`-2013`) hangi
+emrin kapattigi sorulamaz. Bu durumda cikis fiyati TP/SL seviyeleriyle karsilastirilir;
+%0.4 tolerans icindeyse `TP` / `SL` etiketlenir, ikisine de uzaksa `MANUEL/BILINMIYOR`
+kalir. Boylece isabet orani istatistigi dogru cikar.
+
 Dinamik yapilandirma **pozisyon acilirken dondurulur** (`bot_trades.dyn_tp/dyn_sl`).
 Kural sonradan silinse/degisse acik pozisyon giris anindaki kurallariyla yonetilir.
 
@@ -132,9 +137,16 @@ Alti tip, giris kurallari ve dinamik cikis ayni motoru kullanir:
 | `oi_change` | onceki bar sayisi | yuzde | son bar vs N bar ortalamasi |
 | `volume` | onceki bar sayisi | yuzde | son bar vs N bar ortalamasi |
 | `funding` | — | yuzde | |
+| `touch_price` | — | fiyat | **degme**: bar hedefe dokundu mu |
+| `touch_ema` | — | ema periyodu | **degme**: bar EMA'ya dokundu mu |
 
 **OI ve hacimde eksi isareti KULLANILMAZ** — yonu operator belirler:
 `>` 5 = ortalamadan %5 buyuk, `<` 7 = ortalamadan %7 kucuk. Deger hep pozitif saklanir.
+
+**DEGME kosullari** (`touch_price`, `touch_ema`): kapanan mumun **high/low araligi**
+hedefe dokunduysa tetiklenir — fiyat geri donse bile yakalar. Operator kullanilmaz
+(panelde gizlenir, `=` olarak saklanir). En fazla 1 bar gecikme olur; **bilincli karar**:
+anlik fiyat yerine bar kapanisi kullanildi, sahte igneye dayanikli olsun diye.
 
 Mantik: `VE` / `VEYA`, tek kosulda `—` (otomatik kilitlenir).
 Veri toplama `build_ctx()` ile ortak; ayni coin+periyot icin mum basina tek API cagrisi.
@@ -153,9 +165,39 @@ TradingView alarm → panel /webhook (token) → sts_webhooks → executor (5 sn
 - Payload zorunlu: `coin`, `direction`. Digerleri Ayarlar'daki `wh_*` varsayilanlarindan gelir
 - Payload'daki deger varsayilani **ezer** → her alarma ozel TP/SL/teminat mumkun
 - Panelde **mesaj olusturucu** var: alanlari doldur, JSON'u kopyala
+- **Pozisyon kapatma:** payload'a `"action":"close"` ekle, coin disinda alan gerekmez.
+  Cikis sebebi `WEBHOOK_CLOSE`. Pozisyon yoksa kuyrukta `SKIPPED`.
+  Olusturucuda **Islem** secicisi var (Pozisyon ac / Pozisyonu kapat).
 
-**TradingView HTTP'de sadece port 80'e izin verir** — `:8090` calismaz.
-Su an sslip.io adresi kullaniliyor; domain alininca HTTPS'e gecilecek.
+**TradingView HTTP'de sadece port 80'e izin verir.** Panel artik
+`https://stspanel.com` uzerinden (Coolify Traefik + Let's Encrypt).
+Webhook adresi: `https://stspanel.com/webhook`
+Port mapping kaldirildi — `:8090` artik calismiyor.
+
+---
+
+## 8b. KILL-SWITCH — 3 SEVIYE
+
+`sts_control.level` alaninda tutulur; container restart bozmaz.
+
+| Seviye | Ne olur | Kullanim |
+|---|---|---|
+| `RUN` | Normal calisma | — |
+| `PAUSE` | Yeni pozisyon yok. Izleme, yumusak/dinamik cikislar, panel istekleri DEVAM | Strateji supheli, mevcutlari tasiyorum |
+| `STOP` | **Her sey durur** (yumusak TP/SL, dinamik cikis, webhook, kural motoru). Hard TP/SL Binance'te kalir. Panelde kalici kirmizi bant: "Acik pozisyonlar izlenmiyor" | Bot hatali davraniyor, ben devraliyorum |
+
+**Acil cikis** bir seviye degil, bir eylemdir: `req_emergency=true` yazilir, executor
+tum pozisyonlari market ile kapatir (`EMERGENCY` sebebi), sonra `STOP`'a geker.
+**STOP durumundayken de calisir** — bot durdurulmusken bile pozisyonlar kapatilabilir.
+
+Panel: uc buton + durum rozeti. Ucu de onay ister; acil cikis pozisyon listesi ve
+toplam PnL gosterip **ikinci onay** ister.
+
+Tasarim gerekcesi (KKS): en kotu kombinasyon **izlemeyi birakip pozisyonu acik
+tutmak**. Demo'da hard emirler guvenilmez oldugu icin `STOP` gercekten korumasiz
+birakir — bu yuzden ayri bir seviye ve kalici uyari gerekli.
+
+Yerel `bot_stop.flag` dosyasi acil yedek olarak `PAUSE` etkisi yapar.
 
 ---
 
@@ -164,7 +206,10 @@ Su an sslip.io adresi kullaniliyor; domain alininca HTTPS'e gecilecek.
 `demo-fapi.binance.com` stop emirlerinde tutarsiz:
 
 - Emri **kabul eder**, id verir, web arayuzunde **gosterir**
-- Ama API'de **okunamaz** (`-2013`), **iptal edilemez**, **TETIKLENMEZ**
+- Ama API'de **okunamaz** (`-2013`), **iptal edilemez**
+- Tetiklenme **TUTARSIZ**: bir TST pozisyonunda SL tetiklenmedi (mark seviyeyi
+  gecti, kapanmadi), baska bir TST pozisyonunda TP tetiklendi (pnl tam +$100).
+  Yani bazen calisiyor — **guvenilmez**
 - Yeni emir kurmaya calisinca `-4130` "zaten var" der
 - `closePosition` ve `reduceOnly` — ikisinde de ayni
 
@@ -216,6 +261,12 @@ Mimari, tablo, strateji parametresi, cikis katmani veya yeni bir tuzak ortaya
 ciktiginda **bu dosyayi da guncelle ve GitHub'a commit et**. Kod ile talimatin
 ayrisma hakki yoktur. Yeni bir sohbete baslarken once GitHub'daki surumu cek.
 
+### TUZAK 5 — degismeyen alani gonderme
+Panel formlari **sadece gercekten degisen** alanlari gondermeli. Yonet panelinde
+hard TP/SL degismedigi halde gonderilirse executor bosuna Binance emirlerini
+iptal/yeniden kurmaya calisir; demo'da `-4130` ve yaniltici "KORUMASIZ" mesaji
+uretir. `savePos()` mevcut degerle karsilastirir, ayni ise istege eklemez.
+
 ### Emir degistirme
 Binance ayni yonde ikinci `closePosition` emrini reddeder (`-4130`).
 Seviye degistirirken: o **sembolun** emirleri topluca iptal edilir, TP ve SL
@@ -262,19 +313,27 @@ Bes sekme: **Durum**, **Islemler**, **Olaylar**, **Kurallar**, **Ayarlar**
 - **Yonet** butonu: acik pozisyonda hard TP/SL degistir, pozisyona ozel dinamik
   cikis tanimla, elle kapat. Panel acikken liste yeniden cizilmez (form korunur),
   sadece PnL/mark tazelenir.
-- Kill-switch: `sts_control.killswitch` (container bagimsiz)
+- **Kill-switch: 3 seviye** (Duraklat / Bot dur / Acil cikis) + durum rozeti,
+  `STOP`'ta kalici kirmizi bant
+- Fiyatlar buyukluge gore ondalikli: >=100 -> 2 hane, >=1 -> 4, <1 -> 6
 
 ---
 
 ## 13. YAPILACAKLAR
 
-1. Domain + HTTPS — panel ve webhook token'i su an sifresiz gidiyor
-2. `service_role` key sifirlama (sohbette aciga cikti)
-3. Binance API key IP whitelist — canliya gecmeden
-4. 2-3 hafta testnet dogrulamasi
-5. Canliya gecerken pozisyon boyutunu $20-30 ile baslat
-6. Backtest motoru (CLI + yerel OHLCV onbellegi) — ertelendi, backtest ayri
-   chat'te Supabase verisiyle yapiliyor
+1. `service_role` key sifirlama (sohbette aciga cikti)
+2. Binance API key IP whitelist (`168.119.178.59`) — canliya gecmeden
+3. 2-3 hafta testnet dogrulamasi
+4. Canliya gecerken pozisyon boyutunu $20-30 ile baslat
+5. Demo hard TP/SL kisiti — yumusak katman pratikte cozdu, test sonrasi karara baglanacak
 
-**Ertelenen/iptal:** izole Python kod alani (iptal — yerine forma yeni kosul tipi
-eklenir), panel ici backtest bolumu (iptal — KKS ile sohbette yapiliyor)
+**Tamamlandi:** domain + HTTPS (`stspanel.com`, Let's Encrypt), 3 seviyeli kill-switch,
+webhook ile kapatma, degme kosullari, kapanis sebebi tespiti, dedup duzeltmesi,
+yumusak TP/SL, yenile butonu, fiyat formati, savePos duzeltmesi
+
+**Beklemede:** coklu kullanici (uc model tasarlandi: ayni hesap+roller / hesap basina
+ayri executor / sifreli DB — ikincisi onerilen), backtest motoru (ayri chat'te
+Supabase verisiyle yapiliyor)
+
+**Iptal:** izole Python kod alani (yerine forma yeni kosul tipi eklenir),
+panel ici backtest bolumu (KKS ile sohbette yapiliyor)
